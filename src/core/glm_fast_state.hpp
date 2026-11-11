@@ -725,6 +725,7 @@ struct Glm5Model::FastState {
     abyss_igpu_poke_fn igpu_poke = nullptr;   // the service thread's keep-alive while a decode runs
     // the prompt path's host experts on the iGPU (abyss_igpu_rows; STRATA_GLM_PREFILL_IGPU=0: the CPU threads)
     abyss_igpu_rows_fn igpu_rows = nullptr;
+    abyss_igpu_rows_q_fn igpu_rows_q = nullptr;   // the same, x shipped as q8_1 (optional symbol)
     abyss_igpu_register_fn igpu_reg = nullptr;
     abyss_igpu_unregister_fn igpu_unreg = nullptr;
     std::atomic<uint64_t> igpu_calls{0}, igpu_falls{0}, igpu_early{0};   // (early: started before disk reads)

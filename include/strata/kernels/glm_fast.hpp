@@ -448,7 +448,11 @@ void moe_down_cols(int d_type, const MoeColArgs* cols, int nc, int k, int n_embd
 bool rows_experts(int gu_type, int d_type, const uint8_t* base, size_t stride, size_t down_off, const int* light, int n,
                   const int* row_tok, const float* x, int n_tok, int n_embd, int n_ff, float limit, int rlo, int rhi,
                   void* xq_scratch, void* hq_scratch, float* out, int ld, cudaStream_t s,
-                  const unsigned long long* ptrs = nullptr);
+                  const unsigned long long* ptrs = nullptr, const void* xq_in = nullptr);
+/// The prompt path's q8_1 of x on the device (n_tok rows of n_embd floats -> n_tok x n_embd/32 blocks, 36 bytes
+/// each), the same rows_q8_kernel rows_experts runs internally - so a caller that ships q8_1 over PCIe gets the
+/// identical blocks, not a second rounding.  False on a null/shape it cannot take.
+bool rows_quantize(const float* x, int n_tok, int n_embd, void* xq, cudaStream_t s);
 /// rows_experts in the DECODE kernels' arithmetic (the exact combine, STRATA_GLM_LANE_XC): each (expert, token) pair's
 /// rows the bits moe_gate_up / moe_down give that token - and the CPU lane's (lane_q81) - so the prompt's CPU share
 /// does not change its numbers.  The same arguments; false: a type it does not take (rows_exact_type).

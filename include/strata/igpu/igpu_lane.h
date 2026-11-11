@@ -59,6 +59,13 @@ typedef int (*abyss_igpu_x3_finish_fn)(float* out, int n_embd);
 typedef int (*abyss_igpu_rows_fn)(int gu_type, int d_type, int n_embd, int n_ff, size_t down_off, float limit, int ne,
                                   const void* const* blobs, const int* r0, const int* nr, const int* row_tok,
                                   const float* x, int n_tok, int rlo, int rhi, float* out, int ld);
+/// The same call with x already quantized: n_tok x (n_embd / 32) q8_1 blocks, 36 bytes each
+/// (4,608 bytes a 4,096-wide row against 16 KB of f32 - what the link carries).  xq is host
+/// memory registered with abyss_igpu_register; the blocks must be the ones rows_experts would
+/// produce itself.  Optional symbol: absent, the engine keeps the float path.
+typedef int (*abyss_igpu_rows_q_fn)(int gu_type, int d_type, int n_embd, int n_ff, size_t down_off, float limit, int ne,
+                                    const void* const* blobs, const int* r0, const int* nr, const int* row_tok,
+                                    const void* xq, int n_tok, int rlo, int rhi, float* out, int ld);
 /// A no-op kernel when the lane is idle: called every ~50 us while a decode runs, it keeps the iGPU's clocks up -
 /// after 0.3 ms idle a one-expert call took 103 us instead of 57 (Radeon 8060S, power_dpm "auto").
 typedef void (*abyss_igpu_poke_fn)(void);

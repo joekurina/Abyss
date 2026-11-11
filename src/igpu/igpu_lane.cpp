@@ -1025,11 +1025,11 @@ __attribute__((visibility("default"))) void abyss_igpu_unregister(const void* ho
         }
 }
 
-__attribute__((visibility("default"))) int abyss_igpu_rows(int gu_type, int d_type, int n_embd, int n_ff,
-                                                           size_t down_off, float limit, int ne,
-                                                           const void* const* blobs, const int* r0, const int* nr,
-                                                           const int* row_tok, const float* x, int n_tok, int rlo,
-                                                           int rhi, float* out, int ld) {
+static int igpu_rows_impl(int gu_type, int d_type, int n_embd, int n_ff,
+                          size_t down_off, float limit, int ne,
+                          const void* const* blobs, const int* r0, const int* nr,
+                          const int* row_tok, const float* x, const void* xq_in, int n_tok, int rlo,
+                          int rhi, float* out, int ld) {
     DevScope ds;
     std::lock_guard<std::mutex> lk(L.mu);   // (a split's parts share the lane: a prompt's call waits its turn)
     if (!L.open || ne < 1 || rhi <= rlo || ld < n_embd || ld < 2 * n_ff) return 1;
@@ -1037,8 +1037,14 @@ __attribute__((visibility("default"))) int abyss_igpu_rows(int gu_type, int d_ty
         if (hipStreamQuery(L.s) != hipSuccess) return 1;
         L.pending = false;
     }
-    const unsigned long long xd = dev_of(x), td = dev_of(row_tok), od = dev_of(out);
-    if (xd == 0ull || td == 0ull || od == 0ull || dev_of(x + (size_t) n_tok * n_embd - 1) != xd + ((size_t) n_tok * n_embd - 1) * sizeof(float) ||
+    const unsigned long long xd = xq_in != nullptr ? dev_of(xq_in) : dev_of(x);
+    const unsigned long long td = dev_of(row_tok), od = dev_of(out);
+    const size_t xb = xq_in != nullptr ? (size_t) n_tok * (size_t) (n_embd / 32) * kQ8
+                                      : (size_t) n_tok * (size_t) n_embd * sizeof(float);
+    const unsigned long long xe = xq_in != nullptr
+        ? dev_of((const void*) ((const uint8_t*) xq_in + xb - 1))
+        : dev_of(x + (size_t) n_tok * n_embd - 1);
+    if (xd == 0ull || td == 0ull || od == 0ull || xe != xd + (xb - 1) ||
         dev_of(out + (size_t) rhi * ld - 1) != od + ((size_t) rhi * ld - 1) * sizeof(float))
         return 1;
     hipError_t e = hipSuccess;
@@ -1082,7 +1088,7 @@ __attribute__((visibility("default"))) int abyss_igpu_rows(int gu_type, int d_ty
     namespace fz = abyss::igpu_fused;
     static const int chk = [] { const char* v = getenv("ABYSS_IGPU_FUSED_CHECK"); return v != nullptr ? std::atoi(v) : 0; }();
     // (L.dev, not 0: beside a HIP engine on a discrete Radeon, HIP's device 0 is that card)
-    bool fused = fz::available(L.dev) && fz::supported(gu_type, d_type, n_embd, n_ff) && ld == n_embd && n_tok > 0 &&
+    bool fused = xq_in == nullptr && fz::available(L.dev) && fz::supported(gu_type, d_type, n_embd, n_ff) && ld == n_embd && n_tok > 0 &&
                  r0[0] == rlo && (((uintptr_t) od & 15) == 0);
     const size_t gu_row = fz::row_bytes(gu_type, n_embd);
     if (fused && down_off != 2 * (size_t) n_ff * gu_row) fused = false;   // (gate rows, up rows, then down: the lane's layout)
@@ -1143,7 +1149,7 @@ __attribute__((visibility("default"))) int abyss_igpu_rows(int gu_type, int d_ty
         if ((e = grow(L.rchk, L.rchk_b, need)) != hipSuccess) return -1;
         if (!gf::rows_experts(gu_type, d_type, nullptr, 0, down_off, (const int*) ld_d, ne, (const int*) td,
                               (const float*) L.rxsave, n_tok, n_embd, n_ff, limit, rlo, rhi, L.rxq, L.rhq, (float*) L.rchk, ld,
-                              L.s, (const unsigned long long*) pd) ||
+                              L.s, (const unsigned long long*) pd, xq_in) ||
             (e = hipStreamSynchronize(L.s)) != hipSuccess)
             return -1;
         std::vector<float> ref((size_t) (rhi - rlo) * ld);
@@ -1166,7 +1172,7 @@ __attribute__((visibility("default"))) int abyss_igpu_rows(int gu_type, int d_ty
     if (!fused) {
         if (!gf::rows_experts(gu_type, d_type, nullptr, 0, down_off, (const int*) ld_d, ne, (const int*) td,
                               (const float*) xd, n_tok, n_embd, n_ff, limit, rlo, rhi, L.rxq, L.rhq, (float*) od, ld, L.s,
-                              (const unsigned long long*) pd))
+                              (const unsigned long long*) pd, xq_in))
             return 1;
     }
     if ((e = hipStreamSynchronize(L.s)) != hipSuccess) {
@@ -1175,6 +1181,25 @@ __attribute__((visibility("default"))) int abyss_igpu_rows(int gu_type, int d_ty
     }
     if (fused) ++L.n_fused; else ++L.n_rows_k;
     return 0;
+}
+
+__attribute__((visibility("default"))) int abyss_igpu_rows(int gu_type, int d_type, int n_embd, int n_ff,
+                                                           size_t down_off, float limit, int ne,
+                                                           const void* const* blobs, const int* r0, const int* nr,
+                                                           const int* row_tok, const float* x, int n_tok, int rlo,
+                                                           int rhi, float* out, int ld) {
+    return igpu_rows_impl(gu_type, d_type, n_embd, n_ff, down_off, limit, ne, blobs, r0, nr, row_tok, x, nullptr,
+                          n_tok, rlo, rhi, out, ld);
+}
+
+// x already q8_1 (n_tok x n_embd/32 blocks of 36 bytes): no quantize pass, the blocks go straight to the kernels.
+__attribute__((visibility("default"))) int abyss_igpu_rows_q(int gu_type, int d_type, int n_embd, int n_ff,
+                                                             size_t down_off, float limit, int ne,
+                                                             const void* const* blobs, const int* r0, const int* nr,
+                                                             const int* row_tok, const void* xq, int n_tok, int rlo,
+                                                             int rhi, float* out, int ld) {
+    return igpu_rows_impl(gu_type, d_type, n_embd, n_ff, down_off, limit, ne, blobs, r0, nr, row_tok, nullptr, xq,
+                          n_tok, rlo, rhi, out, ld);
 }
 
 __attribute__((visibility("default"))) void abyss_igpu_poke(void) {

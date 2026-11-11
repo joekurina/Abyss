@@ -572,6 +572,11 @@ struct Glm5Model::PrefillState {
     int* id_h = nullptr;      // 0, 1, 2, ..: the iGPU's row -> token map when x went down gathered (into out_h)
     bool x_gathered = false;  // this layer's host rows' x is in out_h (row r = the host's row r), not x_h
     float* out_h = nullptr;
+    static constexpr size_t kQ8Bytes = 36;   // (the lane's block_q8_1: 32 int8 + d + s)
+    void* xq_h = nullptr;     // the iGPU's x shipped as q8_1 (n_embd/32 x 36 bytes a row), when the q8 downlink runs
+    void* xq_d = nullptr;     // the CUDA side's q8_1 staging of the gathered rows
+    size_t xq_h_n = 0;        // rows the pair holds
+    bool x_q81 = false;       // this layer's host-row x went down in xq_h as q8_1
     size_t rows_h_n = 0;
     // the CPU lane's pinned buffers did not allocate (issue #31: a host whose RAM tier is pinned to the limit):
     // the prompts of this process give the CPU no experts - PCIe stages them all, as STRATA_GLM_PREFILL_CPU=0
@@ -2752,6 +2757,26 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 }
                 reg(S->rt_h, n * sizeof(int));
                 reg(S->out_h, n * E * sizeof(float));
+                // the q8_1 downlink's buffers: the same rows as q8_1 blocks (E/32 x 36 bytes each)
+                if (F->igpu_rows_q != nullptr && S->xq_h_n < n) {
+                    const size_t qb = (size_t) (E / 32) * (size_t) S->kQ8Bytes;
+                    if (S->xq_h) cudaFreeHost(S->xq_h);
+                    if (S->xq_d) cudaFree(S->xq_d);
+                    S->xq_h = nullptr;
+                    S->xq_d = nullptr;
+                    S->xq_h_n = 0;
+                    if (cudaHostAlloc((void**) &S->xq_h, n * qb, cudaHostAllocDefault) == cudaSuccess &&
+                        cudaMalloc(&S->xq_d, n * qb) == cudaSuccess) {
+                        S->xq_h_n = n;
+                        reg(S->xq_h, n * qb);
+                    } else {
+                        if (S->xq_h) cudaFreeHost(S->xq_h);
+                        if (S->xq_d) cudaFree(S->xq_d);
+                        S->xq_h = nullptr;
+                        S->xq_d = nullptr;
+                        cudaGetLastError();
+                    }
+                }
             } else {
                 if (S->rt_h) cudaFreeHost(S->rt_h);
                 if (S->out_h) cudaFreeHost(S->out_h);
@@ -3473,12 +3498,31 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             cudaEventRecord(S->ev_x, s);   // the scatter (and x) are done up to here
             cudaStreamWaitEvent(S->xs, S->ev_x, 0);
             S->x_gathered = !x_down && igpu_lane(il) && S->id_h != nullptr;
-            if (S->x_gathered) {   // (OUTPc: the host rows' outputs come back into it later, after the combine read it)
+            static const bool q81_enabled = [] {
+                const char* v = getenv("ABYSS_GLM_Q81");   // 0: the f32 downlink (A/B against the shipped blocks)
+                return v == nullptr || std::atoi(v) != 0;
+            }();
+            S->x_q81 = q81_enabled && S->x_gathered && F->igpu_rows_q != nullptr && S->xq_h != nullptr &&
+                       S->xq_d != nullptr && (size_t) cpu_nrows <= S->xq_h_n;
+            if (S->x_q81) {   // (q8_1 downlink: the lane quantizes every row on arrival anyway - ship the blocks)
                 gather_rows<<<(unsigned) cpu_nrows, 256, 0, s>>>(S->x, M.row_tok + cpu_r0, cpu_nrows, E, M.OUTPc);
+                if (!gf::rows_quantize(M.OUTPc, cpu_nrows, E, S->xq_d, s)) {
+                    S->x_q81 = false;
+                } else {
+                    static bool said = false;
+                    if (!said) {
+                        said = true;
+                        std::fprintf(stderr, "glm prefill: host rows ship to the iGPU as q8_1 (%.1f KB a row, "
+                                             "%.1f KB as f32) - the lane skips its own quantize\n",
+                                     (double) ((E / 32) * S->kQ8Bytes) / 1024.0, (double) (E * sizeof(float)) / 1024.0);
+                    }
+                }
+            }
+            if (S->x_q81) {
                 cudaEventRecord(S->ev_x, s);
                 cudaStreamWaitEvent(S->xs, S->ev_x, 0);
-                cudaMemcpyAsync(S->out_h, M.OUTPc, (size_t) cpu_nrows * E * sizeof(float), cudaMemcpyDeviceToHost, S->xs);
-            } else if (!x_down) {
+                cudaMemcpyAsync(S->xq_h, S->xq_d, (size_t) cpu_nrows * (E / 32) * S->kQ8Bytes,
+                                cudaMemcpyDeviceToHost, S->xs);
                 cudaMemcpyAsync(S->x_h, S->x, (size_t) T * E * sizeof(float), cudaMemcpyDeviceToHost, S->xs);
             }
             cudaMemcpyAsync(S->rt_h, M.row_tok + cpu_r0, (size_t) cpu_nrows * sizeof(int), cudaMemcpyDeviceToHost, S->xs);
@@ -4018,11 +4062,21 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 // (gathered: x row r is out_h row r, read before the outputs overwrite it)
                 igpu_attempted = true;
                 const auto hip_begin = time_cost ? CostClock::now() : CostClock::time_point{};
-                const int rc = S->x_gathered
-                    ? F->igpu_rows(Ly.gu_type, Ly.d_type, E, nff, Ly.down_off, g.swiglu_exp, ncx, bl.data(), r_of.data(),
-                                   nr.data(), S->id_h, S->out_h, cpu_nrows, 0, cpu_nrows, S->out_h, E)
-                    : F->igpu_rows(Ly.gu_type, Ly.d_type, E, nff, Ly.down_off, g.swiglu_exp, ncx, bl.data(), r_of.data(),
-                                   nr.data(), S->rt_h, S->x_h, T, 0, cpu_nrows, S->out_h, E);
+                int rc;
+                if (S->x_q81) {
+                    rc = F->igpu_rows_q(Ly.gu_type, Ly.d_type, E, nff, Ly.down_off, g.swiglu_exp, ncx, bl.data(),
+                                        r_of.data(), nr.data(), S->id_h, S->xq_h, cpu_nrows, 0, cpu_nrows, S->out_h, E);
+                    if (rc != 0) {   // (no q8_1 here after all: bring the f32 rows down so the fallbacks can run)
+                        cudaMemcpy(S->out_h, M.OUTPc, (size_t) cpu_nrows * E * sizeof(float), cudaMemcpyDeviceToHost);
+                        S->x_q81 = false;
+                    }
+                }
+                if (!S->x_q81)
+                    rc = S->x_gathered
+                        ? F->igpu_rows(Ly.gu_type, Ly.d_type, E, nff, Ly.down_off, g.swiglu_exp, ncx, bl.data(), r_of.data(),
+                                       nr.data(), S->id_h, S->out_h, cpu_nrows, 0, cpu_nrows, S->out_h, E)
+                        : F->igpu_rows(Ly.gu_type, Ly.d_type, E, nff, Ly.down_off, g.swiglu_exp, ncx, bl.data(), r_of.data(),
+                                       nr.data(), S->rt_h, S->x_h, T, 0, cpu_nrows, S->out_h, E);
                 igpu_result = rc;
                 if (time_cost) {
                     const auto hip_end = CostClock::now();

@@ -6057,14 +6057,15 @@ void down(Variant v, int type, const MoeDev& d, int k, int n_embd, int n_ff, siz
 bool rows_experts(int gu_type, int d_type, const uint8_t* base, size_t stride, size_t down_off, const int* light, int n,
                   const int* row_tok, const float* x, int n_tok, int n_embd, int n_ff, float limit, int rlo, int rhi,
                   void* xq_scratch, void* hq_scratch, float* out, int ld, cudaStream_t s,
-                  const unsigned long long* ptrs) {
+                  const unsigned long long* ptrs, const void* xq_in) {
     const auto ok = [](int t) { return t == 16 || t == 17 || t == 18 || t == 19; };
     if (!ok(gu_type) || !ok(d_type) || n_embd % 256 || n_ff % (GU_ROWS) || n_embd % (GU_WARPS * 2)) return false;
     if (n <= 0 || rhi <= rlo) return true;
-    auto* xq = (block_q8_1*) xq_scratch;
+    const auto* xq = xq_in != nullptr ? (const block_q8_1*) xq_in : (const block_q8_1*) xq_scratch;
     auto* hq = (block_q8_1*) hq_scratch;
-    rows_q8_kernel<<<(unsigned) (((int64_t) n_tok * (n_embd / 32) * 32 + 255) / 256), 256, 0, s>>>(x, n_embd, n_tok,
-                                                                                                 n_embd, xq);
+    if (xq_in == nullptr)
+        rows_q8_kernel<<<(unsigned) (((int64_t) n_tok * (n_embd / 32) * 32 + 255) / 256), 256, 0, s>>>(
+            x, n_embd, n_tok, n_embd, (block_q8_1*) xq);
     const dim3 ggu((unsigned) (n_ff / GU_ROWS), (unsigned) n), gdn((unsigned) (n_embd / (GU_WARPS * 2)), (unsigned) n);
     switch (gu_type) {
         case 16: rows_gate_up_kernel<16><<<ggu, GU_WARPS * 32, 0, s>>>(base, stride, ptrs, light, row_tok, xq, n_embd, n_ff, out, ld); break;
@@ -6081,6 +6082,14 @@ bool rows_experts(int gu_type, int d_type, const uint8_t* base, size_t stride, s
         default: rows_down_kernel<18><<<gdn, GU_WARPS * 32, 0, s>>>(base, stride, ptrs, down_off, light, hq, rlo, n_ff, n_embd, out, ld); break;
     }
     launch_check("rows_experts");
+    return true;
+}
+
+bool rows_quantize(const float* x, int n_tok, int n_embd, void* xq, cudaStream_t s) {
+    if (x == nullptr || xq == nullptr || n_tok <= 0 || n_embd % 32 != 0) return false;
+    rows_q8_kernel<<<(unsigned) (((int64_t) n_tok * (n_embd / 32) * 32 + 255) / 256), 256, 0, s>>>(
+        x, n_embd, n_tok, n_embd, (block_q8_1*) xq);
+    launch_check("rows_quantize");
     return true;
 }
 

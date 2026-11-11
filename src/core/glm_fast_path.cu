@@ -2174,6 +2174,8 @@ void Glm5Model::fast_igpu_setup() {
     if (const char* pk = getenv("STRATA_GLM_IGPU_POKE"))
         if (std::atoi(pk) == 0) F->igpu_poke = nullptr;
     F->igpu_rows = (abyss_igpu_rows_fn) dlsym(lib, "abyss_igpu_rows");
+    F->igpu_rows_q = (abyss_igpu_rows_q_fn) dlsym(lib, "abyss_igpu_rows_q");
+    if (F->igpu_rows == nullptr) F->igpu_rows_q = nullptr;
     F->igpu_x3 = (abyss_igpu_experts_x3_fn) dlsym(lib, "abyss_igpu_experts_x3");
     F->igpu_x3s = (abyss_igpu_x3_start_fn) dlsym(lib, "abyss_igpu_x3_start");
     F->igpu_x3f = (abyss_igpu_x3_finish_fn) dlsym(lib, "abyss_igpu_x3_finish");
