@@ -3497,7 +3497,17 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             }
             cudaEventRecord(S->ev_x, s);   // the scatter (and x) are done up to here
             cudaStreamWaitEvent(S->xs, S->ev_x, 0);
-            S->x_gathered = !x_down && igpu_lane(il) && S->id_h != nullptr;
+            // the lane only while it is the cheaper of the two per row: both costs are learned
+            // (row_ms_ig for the APU, row_ms for the CPU threads). At the row counts a 32K chunk
+            // produces (~80 rows an expert) the lane costs more per row than the CPU threads, which
+            // is the opposite of the one-row shape its 0.044 ms/expert calibration describes; using it
+            // there measured +8.5 s of 128K prefill. A 5 % margin keeps the choice from flapping.
+            static const bool lane_rowcost = [] {
+                const char* v = getenv("STRATA_GLM_PREFILL_LANE_ROWCOST");   // 0: always use the lane
+                return v == nullptr || std::atoi(v) != 0;
+            }();
+            const bool lane_cheaper = !lane_rowcost || S->row_ms_ig <= S->row_ms * 1.05;
+            S->x_gathered = !x_down && igpu_lane(il) && lane_cheaper && S->id_h != nullptr;
             static const bool q81_enabled = [] {
                 const char* v = getenv("ABYSS_GLM_Q81");   // 0: the f32 downlink (A/B against the shipped blocks)
                 return v == nullptr || std::atoi(v) != 0;
