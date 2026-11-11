@@ -143,6 +143,27 @@ void indexer_batch_scores(float* iq, const uint16_t* K, const float* w, int idx_
 void indexer_batch_select(const float* score, int ld, int ratio, int p0, int T, int top_k, int* sel, int sel_ld,
                           cudaStream_t s);
 
+#if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+/// Optional SM80 scorer, exactly 32 heads x 128 dimensions. Automatic dispatch reads STRATA_DS41_IDX32=1 once,
+/// defaults off, and honors STRATA_DS4_IDX=1 as the original-path override. The split score APIs have width 128.
+/// These explicit entry points bypass flags. False means unsupported or empty geometry and leaves score untouched.
+/// True means the specialized launch was selected. Callers retain the normal CUDA error/synchronization checks.
+/// Packed inputs: iq[T][32][128] and w[T][32] FP32, K[n][128] FP16 with four-byte aligned rows.
+/// Finite Q within FP16 range is split into hi + lo. Accumulation/reduction order can change scores and near ties.
+/// Q, K and w remain unchanged. Batch rows j >= (p0+t+1)/ratio remain unwritten, and ld must cover all visible rows.
+bool indexer_idx32_supported(int idx_heads, int idx_dim);
+bool indexer_scores_idx32(const float* iq, const uint16_t* K, const float* w, int idx_heads, int idx_dim,
+                          int n_vis, float* score, cudaStream_t s);
+bool indexer_batch_scores_idx32(const float* iq, const uint16_t* K, const float* w, int idx_heads, int idx_dim,
+                                int ratio, int p0, int T, float* score, int ld, cudaStream_t s);
+/// Direct launchers for the original plain kernels, independent of environment flags. Width 128, 1..64 heads.
+/// Decode uses the warp dot/reduction. Batch uses the original sequential dot/reduction and causal padding.
+void indexer_scores_reference(const float* iq, const uint16_t* K, const float* w, int idx_heads, int n_vis,
+                              float* score, cudaStream_t s);
+void indexer_batch_scores_reference(const float* iq, const uint16_t* K, const float* w, int idx_heads, int ratio,
+                                    int p0, int T, float* score, int ld, cudaStream_t s);
+#endif
+
 /// Attention per token t at p = p0 + t over its window (keys rows of positions max(0, p - n_swa + 1) .. p) and its
 /// compressed rows (ratio 128: every visible one; ratio 4: sel[t][0 .. min(top_k, visible)); deepseek41, ratio
 /// passed as -1 / -2: every visible row while they fit top_k, else sel[t][0 .. top_k)), sinks, de-roped.  sel_ld:

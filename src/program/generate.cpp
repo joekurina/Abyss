@@ -2276,6 +2276,18 @@ static int glm_pack_generate(const Options& o) {
                 const char* v = std::getenv("STRATA_DS4_DSPARK_NGRAM_CHAIN");
                 return v != nullptr ? std::atof(v) : 0.5;
             }();
+            // STRATA_DS4_DSPARK_FAST=1: the drafter path for a slow host link - the expert-slot uploads are
+            // staged right before the verify window launches (their H2D then hides under the window kernels
+            // instead of stalling an idle device), and STRATA_DS4_DSPARK_ROWS=<n> (1..5, default 5) caps the
+            // block rows a draft computes (the head and the MoE scale with the rows)
+            static const bool d_fast = [] {
+                const char* v = std::getenv("STRATA_DS4_DSPARK_FAST");
+                return v != nullptr && std::atoi(v) != 0;
+            }();
+            static const int d_rows = [] {
+                const char* v = std::getenv("STRATA_DS4_DSPARK_ROWS");
+                return v ? std::max(1, std::min(5, std::atoi(v))) : 5;
+            }();
             NgramDrafter dr(spec_min);
             for (const int64_t t : prompt) dr.push((int32_t) t);
             std::vector<int32_t> ng, came;   // the repeat's proposal; the tokens the step produced after tok
@@ -2433,21 +2445,22 @@ static int glm_pack_generate(const Options& o) {
                 came.clear();
                 const auto td = std::chrono::steady_clock::now();
                 if (!rep && room > 0 && model.dspark_ready()) {
-                    if (!model.dspark_draft(tok, d, c, err)) {
+                    if (!model.dspark_draft(tok, d, c, err, d_fast ? d_rows : -1)) {
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
                     }
+                    const int drm = d_fast ? std::min(room, d_rows) : room;   // (FAST: d_rows drafts computed)
                     if (d_chain > 0.0) {
                         double pc = 1.0;
-                        while (k < room && (pc *= c[k]) >= d_chain) ++k;
+                        while (k < drm && (pc *= c[k]) >= d_chain) ++k;
                     } else {
-                        while (k < room && c[k] >= d_thr) ++k;
+                        while (k < drm && c[k] >= d_thr) ++k;
                     }
-                    dk = room;
+                    dk = drm;
                     if (d_cost) {
                         double a[5];
-                        for (int i = 0; i < room; ++i) a[i] = cal_h[cal_bin(c[i])] / cal_n[cal_bin(c[i])];
-                        k = cost_pick(a, room, k);
+                        for (int i = 0; i < drm; ++i) a[i] = cal_h[cal_bin(c[i])] / cal_n[cal_bin(c[i])];
+                        k = cost_pick(a, drm, k);
                     }
                     ms_dr += ms_since(td);
                 }
@@ -2488,11 +2501,12 @@ static int glm_pack_generate(const Options& o) {
                 }
                 win.assign(1, (int32_t) tok);
                 win.insert(win.end(), d, d + k);
+                if (d_fast) model.dspark_upload();   // (FAST: the copies' H2D hides under the window kernels)
                 if (!model.verify(win, err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
-                model.dspark_upload();   // (none left: verify() made them while the window ran)
+                if (!d_fast) model.dspark_upload();   // (the expert cache's copies under the window)
                 model.spec_steps_ += (uint64_t) k;
                 ++spec_rounds;
                 ++n_win;

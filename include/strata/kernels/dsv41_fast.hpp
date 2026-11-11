@@ -7,6 +7,7 @@
 
 #include "strata/kernels/dsv4_fast.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
 
@@ -63,6 +64,43 @@ void candidates_batch(const float* score, int ld, int ratio, int p0, int T, int 
                       float* bscore, int bld, int* bsel, int* sel, int sel_ld, int keep_off, cudaStream_t s);
 void candidate_mask_batch(float* score, int ld, int ratio, int p0, int T, int cand_min, int block, const int* sel,
                           int sel_ld, int keep_off, cudaStream_t s);
+
+/// Compact decode: bsel holds the original candidates' top min(top_blocks, ceil(n_vis / block), 2048) IDs.
+/// Expand them in ascending absolute row order into rows (top_blocks * block ints), with the valid count in nrows.
+/// Both outputs live through the last consumer. bsel remains scratch. The final partial block contributes valid rows.
+void candidate_rows(const int* bsel, int n_vis, int block, int top_blocks, int* rows, int* nrows, cudaStream_t s);
+/// The plain FP32 indexer arithmetic on rows[0, *nrows), idx_dim 128. capacity >= *nrows, idx_heads <= 64.
+/// score holds capacity floats in compact ordinal order. This entry point always uses the plain warp arithmetic.
+void indexer_candidate_scores(const float* iq, const uint16_t* K, const float* w, int idx_heads, const int* rows,
+                              const int* nrows, int capacity, float* score, cudaStream_t s);
+/// Select by score descending, then absolute row ID. rows is ascending and selection maps ordinals back to rows.
+/// dense_scratch (n_vis floats, disjoint from score) supports the original masked order for nonfinite scores.
+/// 1 <= top_k <= min(*nrows, 2048). sel holds top_k absolute IDs, ready for reuse by later layers.
+void indexer_candidate_select(const float* score, const int* rows, const int* nrows, int n_vis, int top_k,
+                              float* dense_scratch, int* sel, cudaStream_t s);
+
+/// Prompt membership: one uint32_t word per 32 blocks, bit c % 32 of word c / 32 for block c.
+/// The scalar buffer holds ceil(ceil(n_vis / block) / 32) words. Batch keep_off and sel_ld are in ints.
+void candidates_bitset(const float* score, int n_vis, int block, int top_blocks, float* bscore, int* bsel,
+                       uint32_t* keep, cudaStream_t s);
+void candidate_mask_bitset(float* score, int n_vis, int block, const uint32_t* keep, cudaStream_t s);
+void candidates_batch_bitset(const float* score, int ld, int ratio, int p0, int T, int cand_min, int block,
+                             int top_blocks, float* bscore, int bld, int* bsel, int* sel, int sel_ld, int keep_off,
+                             cudaStream_t s);
+void candidate_mask_batch_bitset(float* score, int ld, int ratio, int p0, int T, int cand_min, int block,
+                                 const int* sel, int sel_ld, int keep_off, cudaStream_t s);
+
+/// Frozen process-wide prompt layout. STRATA_DS41_CANDIDATE_BITSET=1 opts in, default 0.
+bool candidate_bitset_enabled();
+/// Full-context row capacity, including the original extra block and 16-byte membership alignment. block > 0.
+inline size_t candidate_keep_bytes(size_t max_ctx, int block, bool bitset) {
+    const size_t blocks = (max_ctx + (size_t) block) / (size_t) block;
+    const size_t bytes = bitset ? ((blocks + 31) / 32) * sizeof(uint32_t) : blocks;
+    return (bytes + 15) / 16 * 16;
+}
+inline size_t candidate_row_bytes(size_t max_ctx, int block, int top_k, bool bitset) {
+    return (size_t) top_k * sizeof(int) + candidate_keep_bytes(max_ctx, block, bitset);
+}
 
 /// Engram's add (spec 3.5) into the 4 streams of R (hc x n_embd) in place: kv = 5 x n_embd (4 keys, the value),
 /// qn / kn = [4][n_embd] norm weights; per stream h: s = rms(R_h) * qn_h . rms(key_h) * kn_h / sqrt(n_embd),

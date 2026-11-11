@@ -15,7 +15,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <climits>
 #include <cstdio>
+#include <cstdlib>
 
 namespace strata::kernels::dsv41 {
 namespace {
@@ -265,6 +267,125 @@ __global__ void mask_batch_kernel(float* __restrict__ score, int ld, int ratio, 
     if (keep[j / block] == 0) score[(size_t) t * ld + j] = -INFINITY;
 }
 
+// Decode retains ascending absolute rows independently of the candidate-selection scratch.
+__global__ void candidate_rows_kernel(const int* __restrict__ bsel, int n_vis, int block, int top,
+                                      int* __restrict__ rows, int* __restrict__ nrows) {
+    __shared__ int ids[strata::kernels::dsa::kMaxTop];
+    const int tid = threadIdx.x;
+    int width = 1;
+    while (width < top) width <<= 1;
+    for (int i = tid; i < width; i += blockDim.x) ids[i] = i < top ? bsel[i] : INT_MAX;
+    __syncthreads();
+    for (int k = 2; k <= width; k <<= 1) {
+        for (int step = k >> 1; step > 0; step >>= 1) {
+            for (int i = tid; i < width; i += blockDim.x) {
+                const int j = i ^ step;
+                if (j > i) {
+                    const int a = ids[i], b = ids[j];
+                    if (((i & k) == 0 && a > b) || ((i & k) != 0 && a < b)) {
+                        ids[i] = b;
+                        ids[j] = a;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    const int count = (top - 1) * block + min(block, n_vis - ids[top - 1] * block);
+    for (int i = tid; i < count; i += blockDim.x) rows[i] = ids[i / block] * block + i % block;
+    if (tid == 0) *nrows = count;
+}
+
+// The pinned plain indexer, with a compact ordinal mapped to its absolute cache row.
+constexpr int CIDX_WARPS = 8;
+__global__ void __launch_bounds__(CIDX_WARPS * 32) candidate_score_kernel(
+        const float* __restrict__ iq, const uint16_t* __restrict__ K, const float* __restrict__ w, int idx_heads,
+        const int* __restrict__ rows, const int* __restrict__ nrows, float* __restrict__ score) {
+    extern __shared__ float s_iq[];
+    float* s_w = s_iq + idx_heads * 128;
+    for (int i = threadIdx.x; i < idx_heads * 128; i += blockDim.x) s_iq[i] = iq[i];
+    for (int i = threadIdx.x; i < idx_heads; i += blockDim.x) s_w[i] = w[i];
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int i = blockIdx.x * CIDX_WARPS + (threadIdx.x >> 5);
+    if (i >= *nrows) return;
+    const int j = rows[i];
+    const uint16_t* kr = K + (size_t) j * 128 + lane * 4;
+    const float k0 = __half2float(__ushort_as_half(kr[0])), k1 = __half2float(__ushort_as_half(kr[1]));
+    const float k2 = __half2float(__ushort_as_half(kr[2])), k3 = __half2float(__ushort_as_half(kr[3]));
+    float acc = 0.0f;
+    for (int h = 0; h < idx_heads; ++h) {
+        const float* qh = s_iq + h * 128 + lane * 4;
+        const float d = warp_sum(qh[0] * k0 + qh[1] * k1 + qh[2] * k2 + qh[3] * k3);
+        acc += fmaxf(d, 0.0f) * s_w[h];
+    }
+    if (lane == 0) score[i] = acc;
+}
+
+__global__ void __launch_bounds__(1024) candidate_select_kernel(
+        const float* __restrict__ score, const int* __restrict__ rows, const int* __restrict__ nrows,
+        int n_vis, int top_k, float* __restrict__ dense, int* __restrict__ sel) {
+    __shared__ int exceptional;
+    const int tid = threadIdx.x, n = *nrows, top = min(top_k, n);
+    if (n <= 0 || top <= 0) return;
+    if (tid == 0) exceptional = 0;
+    __syncthreads();
+    for (int i = tid; i < n; i += blockDim.x)
+        if (!isfinite(score[i])) atomicExch(&exceptional, 1);
+    __syncthreads();
+    if (exceptional) {
+        // Retain the original masked order when a -inf tie includes excluded absolute IDs.
+        for (int j = tid; j < n_vis; j += blockDim.x) dense[j] = -INFINITY;
+        __syncthreads();
+        for (int i = tid; i < n; i += blockDim.x) dense[rows[i]] = score[i];
+        __syncthreads();
+    }
+    strata::kernels::dsa::select_top_pools(exceptional ? dense : score, exceptional ? n_vis : n, top, 1, sel);
+    __syncthreads();
+    if (!exceptional)
+        for (int i = tid; i < top; i += blockDim.x) sel[i] = rows[sel[i]];
+}
+
+__global__ void keep_bitset_kernel(const int* __restrict__ bsel, int top, int B, uint32_t* __restrict__ keep) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < top) {
+        const int c = bsel[i];
+        if (c >= 0 && c < B) atomicOr(keep + c / 32, uint32_t(1) << (c % 32));
+    }
+}
+__global__ void mask_bitset_kernel(float* __restrict__ score, int n_vis, int block,
+                                   const uint32_t* __restrict__ keep) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j < n_vis) {
+        const int c = j / block;
+        if ((keep[c / 32] & (uint32_t(1) << (c % 32))) == 0) score[j] = -INFINITY;
+    }
+}
+__global__ void __launch_bounds__(1024) block_select_batch_bitset_kernel(
+        const float* __restrict__ bscore, int bld, int ratio, int p0, int cand_min, int block, int top_blocks,
+        int* __restrict__ bsel, int* __restrict__ sel, int sel_ld, int keep_off) {
+    const int t = blockIdx.x, n_vis = (p0 + t + 1) / ratio;
+    if (n_vis <= cand_min) return;
+    const int B = (n_vis + block - 1) / block, top = min(min(top_blocks, B), strata::kernels::dsa::kMaxTop);
+    uint32_t* keep = reinterpret_cast<uint32_t*>(sel + (size_t) t * sel_ld + keep_off);
+    for (int i = threadIdx.x; i < (B + 31) / 32; i += blockDim.x) keep[i] = 0;
+    int* bs = bsel + (size_t) t * top_blocks;
+    strata::kernels::dsa::select_top_pools(bscore + (size_t) t * bld, B, top, 1, bs);
+    __syncthreads();
+    for (int i = threadIdx.x; i < top; i += blockDim.x) {
+        const int c = bs[i];
+        if (c >= 0 && c < B) atomicOr(keep + c / 32, uint32_t(1) << (c % 32));
+    }
+}
+__global__ void mask_batch_bitset_kernel(float* __restrict__ score, int ld, int ratio, int p0, int cand_min, int block,
+                                        const int* __restrict__ sel, int sel_ld, int keep_off) {
+    const int t = blockIdx.y, n_vis = (p0 + t + 1) / ratio, j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n_vis <= cand_min || j >= n_vis) return;
+    const uint32_t* keep = reinterpret_cast<const uint32_t*>(sel + (size_t) t * sel_ld + keep_off);
+    const int c = j / block;
+    if ((keep[c / 32] & (uint32_t(1) << (c % 32))) == 0) score[(size_t) t * ld + j] = -INFINITY;
+}
+
 // ---------------------------------------------------------------- Engram's gate and add
 __global__ void __launch_bounds__(512) engram_kernel(float* __restrict__ R, const float* __restrict__ kv,
                                                      const float* __restrict__ qn, const float* __restrict__ kn,
@@ -408,6 +529,81 @@ void candidate_mask_batch(float* score, int ld, int ratio, int p0, int T, int ca
                                                                                          cand_min, block, sel, sel_ld,
                                                                                          keep_off);
     check("candidate_mask_batch");
+}
+
+void candidate_rows(const int* bsel, int n_vis, int block, int top_blocks, int* rows, int* nrows, cudaStream_t s) {
+    if (n_vis <= 0 || block <= 0 || top_blocks <= 0) {
+        cudaMemsetAsync(nrows, 0, sizeof(int), s);
+        return;
+    }
+    const int top = std::min({top_blocks, (n_vis + block - 1) / block, strata::kernels::dsa::kMaxTop});
+    candidate_rows_kernel<<<1, 256, 0, s>>>(bsel, n_vis, block, top, rows, nrows);
+    check("candidate_rows");
+}
+
+void indexer_candidate_scores(const float* iq, const uint16_t* K, const float* w, int idx_heads, const int* rows,
+                              const int* nrows, int capacity, float* score, cudaStream_t s) {
+    if (capacity <= 0) return;
+    const size_t sm = (size_t) (idx_heads * 128 + idx_heads) * sizeof(float);
+    candidate_score_kernel<<<(capacity + CIDX_WARPS - 1) / CIDX_WARPS, CIDX_WARPS * 32, sm, s>>>(
+        iq, K, w, idx_heads, rows, nrows, score);
+    check("indexer_candidate_scores");
+}
+
+void indexer_candidate_select(const float* score, const int* rows, const int* nrows, int n_vis, int top_k,
+                              float* dense_scratch, int* sel, cudaStream_t s) {
+    if (n_vis <= 0 || top_k <= 0) return;
+    candidate_select_kernel<<<1, 1024, 0, s>>>(score, rows, nrows, n_vis, std::min(top_k, strata::kernels::dsa::kMaxTop),
+                                              dense_scratch, sel);
+    check("indexer_candidate_select");
+}
+
+void candidates_bitset(const float* score, int n_vis, int block, int top_blocks, float* bscore, int* bsel,
+                       uint32_t* keep, cudaStream_t s) {
+    if (n_vis <= 0) return;
+    const int B = (n_vis + block - 1) / block;
+    const int top = std::min({top_blocks, B, strata::kernels::dsa::kMaxTop});
+    cudaMemsetAsync(keep, 0, (size_t) ((B + 31) / 32) * sizeof(uint32_t), s);
+    block_max_kernel<<<(B + 255) / 256, 256, 0, s>>>(score, n_vis, block, bscore, B);
+    block_select_kernel<<<1, 1024, 0, s>>>(bscore, B, top, bsel);
+    keep_bitset_kernel<<<(top + 255) / 256, 256, 0, s>>>(bsel, top, B, keep);
+    check("candidates_bitset");
+}
+
+void candidate_mask_bitset(float* score, int n_vis, int block, const uint32_t* keep, cudaStream_t s) {
+    if (n_vis <= 0) return;
+    mask_bitset_kernel<<<(n_vis + 255) / 256, 256, 0, s>>>(score, n_vis, block, keep);
+    check("candidate_mask_bitset");
+}
+
+void candidates_batch_bitset(const float* score, int ld, int ratio, int p0, int T, int cand_min, int block,
+                             int top_blocks, float* bscore, int bld, int* bsel, int* sel, int sel_ld, int keep_off,
+                             cudaStream_t s) {
+    const int n_max = (p0 + T) / ratio;
+    if (T <= 0 || n_max <= cand_min) return;
+    const int B = (n_max + block - 1) / block;
+    block_max_batch_kernel<<<dim3((unsigned) ((B + 255) / 256), (unsigned) T), 256, 0, s>>>(
+        score, ld, ratio, p0, cand_min, block, bscore, bld);
+    block_select_batch_bitset_kernel<<<T, 1024, 0, s>>>(bscore, bld, ratio, p0, cand_min, block, top_blocks,
+                                                        bsel, sel, sel_ld, keep_off);
+    check("candidates_batch_bitset");
+}
+
+void candidate_mask_batch_bitset(float* score, int ld, int ratio, int p0, int T, int cand_min, int block,
+                                 const int* sel, int sel_ld, int keep_off, cudaStream_t s) {
+    const int n_max = (p0 + T) / ratio;
+    if (T <= 0 || n_max <= cand_min) return;
+    mask_batch_bitset_kernel<<<dim3((unsigned) ((n_max + 255) / 256), (unsigned) T), 256, 0, s>>>(
+        score, ld, ratio, p0, cand_min, block, sel, sel_ld, keep_off);
+    check("candidate_mask_batch_bitset");
+}
+
+bool candidate_bitset_enabled() {
+    static const bool bits = [] {
+        const char* v = std::getenv("STRATA_DS41_CANDIDATE_BITSET");
+        return v != nullptr && std::atoi(v) == 1;
+    }();
+    return bits;
 }
 
 // the token's Engram rows of one table, once the host's reader has landed them in pinned memory (*flag == want):

@@ -41,6 +41,7 @@
 #include "strata/prefill/gemm.hpp"
 #endif
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/lane_cost.hpp"
 
 #include "ggml.h"
 
@@ -75,6 +76,30 @@ namespace mmq = strata::prefill::mmq;
 namespace q35 = strata::kernels::q35;
 
 namespace {
+
+bool prefill_ready_cost_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("STRATA_GLM_PREFILL_READY_COST");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return enabled;
+}
+
+bool prefill_cost_profile_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("STRATA_GLM_PREFILL_COST_PROF");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return enabled;
+}
+
+struct PrefillLaneCostStat {
+    uint64_t calls = 0, hip_calls = 0, cpu_calls = 0, declines = 0, errors = 0;
+    uint64_t hip_rows = 0, cpu_rows = 0;
+    double input_wait_ms = 0.0, hip_api_ms = 0.0, service_ms = 0.0, upload_enqueue_ms = 0.0;
+    int last_chunk_rows = 0, gu_type = 0, down_type = 0;
+    bool last_gathered = false;
+};
 
 // the RAM free now (MemAvailable; Windows: the smaller of free RAM and free commit), 0 when unknown
 int64_t avail_ram_bytes() {
@@ -565,6 +590,7 @@ struct Glm5Model::PrefillState {
     double row_ms_ig = 0.009, fix_ms_ig = 0.045;
     uint64_t ig_experts = 0, ig_rows = 0;
     std::vector<const void*> ig_reg;
+    std::map<int, PrefillLaneCostStat> lane_cost_stats;
     // the split's balance, learned: the host's estimates times kappa, nudged each layer by the host's time over the
     // copy stream's (ev_c0 .. ev_c1: the staged copies) - the two lanes should end together
     double kappa = 1.0;
@@ -1216,6 +1242,16 @@ std::pair<size_t, size_t> Glm5Model::prefill_bytes_for(size_t T) const {
 
 size_t Glm5Model::prefill_v41_row() const {
     if (!g_.v41) return 0;
+    namespace d41 = strata::kernels::dsv41;
+    if (d41::candidate_bitset_enabled()) {
+        static thread_local bool announced = false;
+        if (!announced) {
+            std::fprintf(stderr, "deepseek41 optimization: prompt candidate bitset active, context=%lld row_bytes=%zu\n",
+                         (long long) max_ctx_, d41::candidate_row_bytes((size_t) max_ctx_, g_.cand_bs, g_.idx_top_k, true));
+            announced = true;
+        }
+        return d41::candidate_row_bytes((size_t) max_ctx_, g_.cand_bs, g_.idx_top_k, true);
+    }
     const size_t keep = ((size_t) (max_ctx_ + g_.cand_bs) / (size_t) g_.cand_bs + 15) / 16 * 16;
     return (size_t) g_.idx_top_k * sizeof(int) + keep;
 }
@@ -1839,6 +1875,8 @@ bool Glm5Model::prefill_v41_mixer(int il, int64_t p0_64, int tn, int row0, const
     // STRATA_GLM_V41_ATTN_TOK=1: steps 2-3 a token at a time on the token path's kernels (A/B, v1.3.59's path)
     static const bool attn_tok = [] { const char* v = getenv("STRATA_GLM_V41_ATTN_TOK"); return v && std::atoi(v) != 0; }();
     const size_t vr = prefill_v41_row();
+    const bool keep_bits = d41::candidate_bitset_enabled();
+    F->v41_cpos = -1;
     if (!attn_tok) {
         S->mark("v41_proj", s);
         // 2. the window keys (the ring's last positions, then this sub-batch's: prep over the batch), q_a's norm, the
@@ -1916,22 +1954,40 @@ bool Glm5Model::prefill_v41_mixer(int il, int64_t p0_64, int tn, int row0, const
                     float* const bscore = B.score + (size_t) gn * ld;
                     int* const bsel = (int*) (bscore + (size_t) gn * bld);
                     int* const sel_g = sel0 + (size_t) g0 * sel_ld;
-                    if (il == g.cand_layer)
-                        d41::candidates_batch(B.score, ld, r, p0 + g0, gn, cand_min, g.cand_bs, g.cand_blocks, bscore,
-                                              bld, bsel, sel_g, sel_ld, g.idx_top_k, s);
-                    else
-                        d41::candidate_mask_batch(B.score, ld, r, p0 + g0, gn, cand_min, g.cand_bs, sel_g, sel_ld,
-                                                  g.idx_top_k, s);
+                    if (keep_bits) {
+                        if (il == g.cand_layer)
+                            d41::candidates_batch_bitset(B.score, ld, r, p0 + g0, gn, cand_min, g.cand_bs, g.cand_blocks,
+                                                         bscore, bld, bsel, sel_g, sel_ld, g.idx_top_k, s);
+                        else
+                            d41::candidate_mask_batch_bitset(B.score, ld, r, p0 + g0, gn, cand_min, g.cand_bs,
+                                                             sel_g, sel_ld, g.idx_top_k, s);
+                    } else {
+                        if (il == g.cand_layer)
+                            d41::candidates_batch(B.score, ld, r, p0 + g0, gn, cand_min, g.cand_bs, g.cand_blocks, bscore,
+                                                  bld, bsel, sel_g, sel_ld, g.idx_top_k, s);
+                        else
+                            d41::candidate_mask_batch(B.score, ld, r, p0 + g0, gn, cand_min, g.cand_bs, sel_g, sel_ld,
+                                                      g.idx_top_k, s);
+                    }
                 } else if (cand)
                     for (int t = g0; t < g0 + gn; ++t) {
                         const int n_vis = (p0 + t + 1) / r;
                         if (n_vis <= cand_min) continue;
                         float* const sc = B.score + (size_t) (t - g0) * ld;
                         unsigned char* const keep = (unsigned char*) (sel0 + (size_t) t * sel_ld + g.idx_top_k);
-                        if (il == g.cand_layer)
-                            d41::candidates(sc, n_vis, g.cand_bs, g.cand_blocks, F->v41_bscore, F->v41_bsel, keep, s);
-                        else
-                            d41::candidate_mask(sc, n_vis, g.cand_bs, keep, s);
+                        if (keep_bits) {
+                            auto* bits = reinterpret_cast<uint32_t*>(keep);
+                            if (il == g.cand_layer)
+                                d41::candidates_bitset(sc, n_vis, g.cand_bs, g.cand_blocks, F->v41_bscore, F->v41_bsel,
+                                                       bits, s);
+                            else
+                                d41::candidate_mask_bitset(sc, n_vis, g.cand_bs, bits, s);
+                        } else {
+                            if (il == g.cand_layer)
+                                d41::candidates(sc, n_vis, g.cand_bs, g.cand_blocks, F->v41_bscore, F->v41_bsel, keep, s);
+                            else
+                                d41::candidate_mask(sc, n_vis, g.cand_bs, keep, s);
+                        }
                     }
                 ds::indexer_batch_select(B.score, ld, r, p0 + g0, gn, g.idx_top_k, sel0 + (size_t) g0 * sel_ld, sel_ld, s);
                 g0 += gn;
@@ -2004,11 +2060,20 @@ bool Glm5Model::prefill_v41_mixer(int il, int64_t p0_64, int tn, int row0, const
                     if (Ly.idx_src) {
                         ds::indexer_scores(iq, Ly.idx_cache, B.iw + (size_t) t * g.idx_heads, g.idx_heads, n_vis,
                                            F->v41_score, s);
-                        if (il == g.cand_layer && n_vis > g.cand_blocks * g.cand_bs)
-                            d41::candidates(F->v41_score, n_vis, g.cand_bs, g.cand_blocks, F->v41_bscore, F->v41_bsel,
-                                            keep_buf, s);
-                        if (il > g.cand_layer && n_vis > g.cand_blocks * g.cand_bs)
-                            d41::candidate_mask(F->v41_score, n_vis, g.cand_bs, keep_buf, s);
+                        if (keep_bits) {
+                            auto* bits = reinterpret_cast<uint32_t*>(keep_buf);
+                            if (il == g.cand_layer && n_vis > g.cand_blocks * g.cand_bs)
+                                d41::candidates_bitset(F->v41_score, n_vis, g.cand_bs, g.cand_blocks, F->v41_bscore,
+                                                       F->v41_bsel, bits, s);
+                            if (il > g.cand_layer && n_vis > g.cand_blocks * g.cand_bs)
+                                d41::candidate_mask_bitset(F->v41_score, n_vis, g.cand_bs, bits, s);
+                        } else {
+                            if (il == g.cand_layer && n_vis > g.cand_blocks * g.cand_bs)
+                                d41::candidates(F->v41_score, n_vis, g.cand_bs, g.cand_blocks, F->v41_bscore, F->v41_bsel,
+                                                keep_buf, s);
+                            if (il > g.cand_layer && n_vis > g.cand_blocks * g.cand_bs)
+                                d41::candidate_mask(F->v41_score, n_vis, g.cand_bs, keep_buf, s);
+                        }
                         ds::indexer_select(F->v41_score, n_vis, g.idx_top_k, sel_buf, s);
                     }
                     n_comp = g.idx_top_k;
@@ -2781,10 +2846,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     cudaMemcpyAsync(F->x, xs + (size_t) t * E, (size_t) E * sizeof(float), cudaMemcpyDeviceToDevice, s);
                     gf::quantize_q8_1(F->x, F->xq, E, s);
                     pf_sel_ = (int*) (S->v41_rows + (size_t) (t0 + t) * vr);
-                    pf_keep_ = (unsigned char*) (pf_sel_ + g.idx_top_k);
+                    const bool keep_bits = strata::kernels::dsv41::candidate_bitset_enabled();
+                    pf_keep_ = keep_bits ? nullptr : (unsigned char*) (pf_sel_ + g.idx_top_k);
+                    pf_keep_bits_ = keep_bits ? reinterpret_cast<uint32_t*>(pf_sel_ + g.idx_top_k) : nullptr;
                     const bool ok = fast_dsv41_attn(il, p0 + t0 + t, err);
                     pf_sel_ = nullptr;
                     pf_keep_ = nullptr;
+                    pf_keep_bits_ = nullptr;
                     if (!ok) return false;
                     cudaMemcpyAsync(mixer + (size_t) t * E, F->mixer, (size_t) E * sizeof(float),
                                     cudaMemcpyDeviceToDevice, s);
@@ -3905,20 +3973,38 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         if (cpu_nrows > 0) {
             namespace kc = strata::kernels::cpu;
             const auto tc = std::chrono::steady_clock::now();
+            const bool ready_cost = prefill_ready_cost_enabled();
+            const bool cost_profile = prefill_cost_profile_enabled();
+            static thread_local bool cost_announced = false;
+            if (ready_cost && !cost_announced) {
+                std::fprintf(stderr, "deepseek41 optimization: ready-to-result prefill lane learner active\n");
+                cost_announced = true;
+            }
+            const bool time_cost = ready_cost || cost_profile;
+            using CostClock = std::chrono::steady_clock;
+            double service_ms = 0.0, hip_api_ms = 0.0, upload_enqueue_ms = 0.0;
+            bool igpu_attempted = false;
+            int igpu_result = 0;
             const auto& nf = F->cpu_fmt[(size_t) il];
             constexpr size_t kA = kc::kNativeActBytes, kH = kc::kNativeHBytes;
             constexpr int kGu = 32, kDn = 64;
             if (S->c_act.size() < (size_t) cpu_nrows * kA) S->c_act.resize((size_t) cpu_nrows * kA);
             if (S->c_hq.size() < (size_t) cpu_nrows * kH) S->c_hq.resize((size_t) cpu_nrows * kH);
             if (S->c_ff.size() < (size_t) cpu_nrows * nff) S->c_ff.resize((size_t) cpu_nrows * nff);
+            const auto wait_begin = time_cost ? CostClock::now() : CostClock::time_point{};
             if (!glmfast::cuda_ok(cudaEventSynchronize(S->ev_xd), "glm prompt CPU rows", err)) return false;
+            const auto input_ready = time_cost ? CostClock::now() : CostClock::time_point{};
+            auto cpu_service_begin = input_ready;
             const int ncx = (int) cpu_set.size();
             std::vector<int> r_of((size_t) ncx);   // each expert's first row in the CPU segment
             for (int j = 0; j < ncx; ++j) r_of[(size_t) j] = S->h_base[cpu_set[(size_t) j].e] - cpu_r0;
             const auto up = [&](int ra, int rb) {
+                const auto begin = time_cost && rb > ra ? CostClock::now() : CostClock::time_point{};
                 if (rb > ra)
                     cudaMemcpyAsync(M.OUTPc + (size_t) ra * E, S->out_h + (size_t) ra * E,
                                     (size_t) (rb - ra) * E * sizeof(float), cudaMemcpyHostToDevice, F->copy);
+                if (time_cost && rb > ra)
+                    upload_enqueue_ms += std::chrono::duration<double, std::milli>(CostClock::now() - begin).count();
             };
             // the iGPU first: the whole set in one call, the outputs straight into out_h
             bool on_igpu = false;
@@ -3930,11 +4016,19 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     nr[(size_t) j] = S->h_counts[cpu_set[(size_t) j].e];
                 }
                 // (gathered: x row r is out_h row r, read before the outputs overwrite it)
+                igpu_attempted = true;
+                const auto hip_begin = time_cost ? CostClock::now() : CostClock::time_point{};
                 const int rc = S->x_gathered
                     ? F->igpu_rows(Ly.gu_type, Ly.d_type, E, nff, Ly.down_off, g.swiglu_exp, ncx, bl.data(), r_of.data(),
                                    nr.data(), S->id_h, S->out_h, cpu_nrows, 0, cpu_nrows, S->out_h, E)
                     : F->igpu_rows(Ly.gu_type, Ly.d_type, E, nff, Ly.down_off, g.swiglu_exp, ncx, bl.data(), r_of.data(),
                                    nr.data(), S->rt_h, S->x_h, T, 0, cpu_nrows, S->out_h, E);
+                igpu_result = rc;
+                if (time_cost) {
+                    const auto hip_end = CostClock::now();
+                    hip_api_ms = std::chrono::duration<double, std::milli>(hip_end - hip_begin).count();
+                    if (rc == 0) service_ms = std::chrono::duration<double, std::milli>(hip_end - input_ready).count();
+                }
                 if (rc == 0) {
                     on_igpu = true;
                     S->ig_experts += (uint64_t) ncx;
@@ -3985,6 +4079,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 });
                 up(0, cpu_nrows);
             } else if (!on_igpu) {
+                if (time_cost && igpu_attempted) cpu_service_begin = CostClock::now();
                 F->cpu_pool->run(cpu_nrows, [&](int r) {
                     const float* xr = S->x_gathered ? S->out_h + (size_t) r * E : S->x_h + (size_t) S->rt_h[r] * E;
                     kc::native_quant_act(nf, xr, S->c_act.data() + (size_t) r * kA);
@@ -4153,6 +4248,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 down(0, j_split);
                 up(0, r_split);
                 down(j_split, ncx);
+                if (time_cost)
+                    service_ms = std::chrono::duration<double, std::milli>(CostClock::now() - cpu_service_begin).count()
+                                 - upload_enqueue_ms;
                 up(r_split, cpu_nrows);
             }
             cudaEventRecord(S->ev_out, F->copy);
@@ -4161,6 +4259,24 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             const auto th = std::chrono::steady_clock::now();
             const double dt = std::chrono::duration<double, std::milli>(th - tc).count();
             const double dl_host = std::chrono::duration<double, std::milli>(th - tp).count();
+            if (cost_profile) {
+                auto& cs = S->lane_cost_stats[il];
+                ++cs.calls;
+                cs.hip_calls += on_igpu;
+                cs.cpu_calls += !on_igpu;
+                cs.declines += igpu_attempted && igpu_result > 0;
+                cs.errors += igpu_attempted && igpu_result < 0;
+                cs.hip_rows += on_igpu ? (uint64_t) cpu_nrows : 0;
+                cs.cpu_rows += on_igpu ? 0 : (uint64_t) cpu_nrows;
+                cs.input_wait_ms += std::chrono::duration<double, std::milli>(input_ready - wait_begin).count();
+                cs.hip_api_ms += hip_api_ms;
+                cs.service_ms += service_ms;
+                cs.upload_enqueue_ms += upload_enqueue_ms;
+                cs.last_chunk_rows = T;
+                cs.gu_type = Ly.gu_type;
+                cs.down_type = Ly.d_type;
+                cs.last_gathered = S->x_gathered;
+            }
             // the prestage count: the copy stream idle before the plan (the copies landed early) -> as many more as
             // that time moves; every other expert on the CPU and it still done before the copies -> fewer by the
             // difference; else (the plan balanced the two) the same
@@ -4192,12 +4308,17 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 S->tr[(size_t) il].dcpu = dt;
                 S->tr[(size_t) il].dl = dl_host;
             }
-            if (cpu_nrows >= 64 && on_igpu)   // (a layer with a few rows says little about the per-row cost)
-                S->row_ms_ig = 0.5 * S->row_ms_ig +
-                               0.5 * std::max(0.002, (dt - (double) ncx * S->fix_ms_ig) / (double) cpu_nrows);
-            else if (cpu_nrows >= 64)
-                S->row_ms = 0.5 * S->row_ms +
-                            0.5 * std::max(0.005, (dt - 2.0 * (double) ncx * F->cpu_c_ms) / (double) cpu_nrows);
+            if (ready_cost) {
+                strata::prefill::learn_ready_lane_cost(S->row_ms, S->row_ms_ig, cpu_nrows, ncx, service_ms,
+                                                       on_igpu, igpu_attempted, F->cpu_c_ms, S->fix_ms_ig);
+            } else {
+                if (cpu_nrows >= 64 && on_igpu)   // (a layer with a few rows says little about the per-row cost)
+                    S->row_ms_ig = 0.5 * S->row_ms_ig +
+                                   0.5 * std::max(0.002, (dt - (double) ncx * S->fix_ms_ig) / (double) cpu_nrows);
+                else if (cpu_nrows >= 64)
+                    S->row_ms = 0.5 * S->row_ms +
+                                0.5 * std::max(0.005, (dt - 2.0 * (double) ncx * F->cpu_c_ms) / (double) cpu_nrows);
+            }
             // the balance: when the copy stream's staged copies ended against when the host's experts did, both from
             // the plan's start (prestage copies it still owed and x's way down included)
             if (n_staged_pcie > 0) {
@@ -4844,6 +4965,22 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             std::fprintf(stderr, "glm prefill: the exact prompt's combine ran as the window filled in %llu layers (not one "
                                  "order: STRATA_GLM_PREFILL_WINDOW=0 keeps one window)\n",
                          (unsigned long long) pf_->x_flushed);
+    }
+    if (prefill_cost_profile_enabled()) {
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+            for (const auto& entry : m->pf_->lane_cost_stats) {
+                const auto& c = entry.second;
+                std::fprintf(stderr, "glm prefill lane cost cumulative: layer=%d gu=%d down=%d last_T=%d gathered=%d "
+                                     "calls=%llu hip_calls=%llu cpu_calls=%llu declines=%llu errors=%llu "
+                                     "hip_rows=%llu cpu_rows=%llu input_wait_ms=%.3f hip_api_ms=%.3f "
+                                     "service_ms=%.3f upload_enqueue_ms=%.3f ready_learner=%d\n",
+                             entry.first, c.gu_type, c.down_type, c.last_chunk_rows, (int) c.last_gathered,
+                             (unsigned long long) c.calls, (unsigned long long) c.hip_calls,
+                             (unsigned long long) c.cpu_calls, (unsigned long long) c.declines,
+                             (unsigned long long) c.errors, (unsigned long long) c.hip_rows,
+                             (unsigned long long) c.cpu_rows, c.input_wait_ms, c.hip_api_ms,
+                             c.service_ms, c.upload_enqueue_ms, (int) prefill_ready_cost_enabled());
+            }
     }
     return true;
 }

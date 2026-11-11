@@ -396,8 +396,14 @@ bool Glm5Model::dsv41_alloc(std::string& err) {
             slot_ratio[s] = g.ratio(il);
             slot_rows[s] = ctx / (size_t) g.ratio(il) + 1;
         }
+    const char* compact_env = std::getenv("STRATA_DS41_COMPACT_CANDIDATES");
+    const bool compact = compact_env != nullptr && std::atoi(compact_env) == 1 && l0_ == 0 && l1_ == g.n_layers &&
+                         g.cand_layer == 20 && g.cand_bs == 8 && g.cand_blocks == 2048 && g.idx_top_k == 512 &&
+                         g.idx_heads == 32 && g.idx_key == 128;
+    const size_t compact_rows = (size_t) g.cand_blocks * g.cand_bs;
     const size_t B = ctx / (size_t) g.cand_bs + 2;
     size_t bytes = 0;
+    if (compact) bytes += al(compact_rows * sizeof(int)) + al(sizeof(int)) + al(compact_rows * sizeof(float));
     bytes += (size_t) g.n_layers * al((size_t) ds_ring_ * D * 2);
     for (int s = 0; s < 4; ++s)
         if (slot_rows[s]) bytes += al(slot_rows[s] * D * 2) + al(slot_rows[s] * K * 2) + al(FastState::kV41PendRing * 2 * D * 4);
@@ -473,6 +479,11 @@ bool Glm5Model::dsv41_alloc(std::string& err) {
     F->v41_bscore = (float*) take(B * 4);
     F->v41_bsel = (int*) take((size_t) g.cand_blocks * 4);
     F->v41_keep = (unsigned char*) take(B);
+    if (compact) {
+        F->v41_crows = (int*) take(compact_rows * sizeof(int));
+        F->v41_cn = (int*) take(sizeof(int));
+        F->v41_cscore = (float*) take(compact_rows * sizeof(float));
+    }
     F->v41_eng = (float*) take((size_t) 2 * kEngCols * kEngDim * 4);
     F->v41_eng_kv = (float*) take((size_t) 5 * g.n_embd * 4);
     F->v41_eng_q = take((size_t) 2 * kEngCols * kEngDim / 32 * 36);
@@ -932,6 +943,8 @@ bool Glm5Model::fast_dsv41_attn(int il, int64_t p64, std::string& err) {
     const auto& Ly = F->L[(size_t) il];
     const int p = (int) p64;
     const int D = g.head_dim, r = Ly.ratio;
+    // Each complete token rebuilds its candidate rows. Prompt rows own their membership separately.
+    if (il <= g.cand_layer || pf_sel_ != nullptr) F->v41_cpos = -1;
     const ds::Rope rope = layer_rope(g, r != 0), crope = layer_rope(g, true);
 
     // 1. the projections of x: q_a, kv, the compressor (KV sources), the indexer's weights (index sources)
@@ -1010,13 +1023,47 @@ bool Glm5Model::fast_dsv41_attn(int il, int64_t p64, std::string& err) {
         const int n_vis = (p + 1) / r;
         if (n_vis > g.idx_top_k) {
             if (Ly.idx_src) {
-                ds::indexer_scores(F->iq, Ly.idx_cache, F->iw, g.idx_heads, n_vis, F->v41_score, s);
-                if (il == g.cand_layer && n_vis > g.cand_blocks * g.cand_bs)
-                    d41::candidates(F->v41_score, n_vis, g.cand_bs, g.cand_blocks, F->v41_bscore, F->v41_bsel,
-                                    keep_buf, s);
-                if (il > g.cand_layer && n_vis > g.cand_blocks * g.cand_bs)
-                    d41::candidate_mask(F->v41_score, n_vis, g.cand_bs, keep_buf, s);
-                ds::indexer_select(F->v41_score, n_vis, g.idx_top_k, sel_buf, s);
+                const bool cand = n_vis > g.cand_blocks * g.cand_bs;
+                const bool compact = cand && pf_sel_ == nullptr && F->v41_crows != nullptr &&
+                                     F->v41_cpos == p64 && F->v41_cvis == n_vis && F->v41_cslot == Ly.slot &&
+                                     il == F->v41_cnext && (il == 24 || il == 28 || il == 32 || il == 36);
+                if (compact) {
+                    static thread_local bool announced = false;
+                    if (!announced) {
+                        std::fprintf(stderr, "deepseek41 optimization: compact decode candidates active at layer %d, visible=%d\n", il, n_vis);
+                        announced = true;
+                    }
+                    d41::indexer_candidate_scores(F->iq, Ly.idx_cache, F->iw, g.idx_heads, F->v41_crows, F->v41_cn,
+                                                   g.cand_blocks * g.cand_bs, F->v41_cscore, s);
+                    d41::indexer_candidate_select(F->v41_cscore, F->v41_crows, F->v41_cn, n_vis, g.idx_top_k,
+                                                   F->v41_score, sel_buf, s);
+                    F->v41_cnext += 4;
+                } else {
+                    ds::indexer_scores(F->iq, Ly.idx_cache, F->iw, g.idx_heads, n_vis, F->v41_score, s);
+                    if (il == g.cand_layer && cand) {
+                        if (pf_keep_bits_ != nullptr)
+                            d41::candidates_bitset(F->v41_score, n_vis, g.cand_bs, g.cand_blocks, F->v41_bscore,
+                                                    F->v41_bsel, pf_keep_bits_, s);
+                        else
+                            d41::candidates(F->v41_score, n_vis, g.cand_bs, g.cand_blocks, F->v41_bscore, F->v41_bsel,
+                                            keep_buf, s);
+                        if (pf_sel_ == nullptr && F->v41_crows != nullptr) {
+                            d41::candidate_rows(F->v41_bsel, n_vis, g.cand_bs, g.cand_blocks, F->v41_crows,
+                                                 F->v41_cn, s);
+                            F->v41_cpos = p64;
+                            F->v41_cvis = n_vis;
+                            F->v41_cslot = Ly.slot;
+                            F->v41_cnext = 24;
+                        }
+                    }
+                    if (il > g.cand_layer && cand) {
+                        if (pf_keep_bits_ != nullptr)
+                            d41::candidate_mask_bitset(F->v41_score, n_vis, g.cand_bs, pf_keep_bits_, s);
+                        else
+                            d41::candidate_mask(F->v41_score, n_vis, g.cand_bs, keep_buf, s);
+                    }
+                    ds::indexer_select(F->v41_score, n_vis, g.idx_top_k, sel_buf, s);
+                }
                 if (F->prof_on) F->mark("ds_index");
             }
             n_comp = g.idx_top_k;

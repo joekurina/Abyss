@@ -778,7 +778,7 @@ void Glm5Model::dspark_upload() {
     D->ms_up += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
-bool Glm5Model::dspark_draft(int32_t y, int32_t* drafts, float* conf, std::string& err) {
+bool Glm5Model::dspark_draft(int32_t y, int32_t* drafts, float* conf, std::string& err, int rows) {
     if (dfl_ != nullptr) return dflash_draft(y, drafts, conf, err);   // (Qwen3.8's DFlash 2 block)
     if (dsp_ == nullptr && q35_mtp_on()) return q35_mtp_draft(y, drafts, conf, err);   // (qwen35moe's NextN block)
     if (dsp_ == nullptr && next_port_ != nullptr && next_port_->mtp_on()) {   // (qwen4exp's layer: the last part)
@@ -798,6 +798,9 @@ bool Glm5Model::dspark_draft(int32_t y, int32_t* drafts, float* conf, std::strin
     const int E = g.n_embd, NE = D->ne, K = D->k, FF = D->ff, V = g.n_vocab, DH = g.head_dim;
     const int HD = D->nh * DH, OL = D->og * D->olr, QL = D->ql;
     const size_t HCE = 4 * (size_t) E, q8e = (size_t) (E / 32) * kQ8;
+    // STRATA_DS4_DSPARK_FAST: the block rows this draft computes (rows <= 0: all of them). The rows are
+    // causal in the ring (row i sees positions < pos + i), so computing fewer leaves the kept ones identical.
+    const int nb = rows > 0 ? std::max(1, std::min(kB, rows)) : kB;
     // the context rows [lo, pos) when the ring holds every one of them, else none
     int64_t lo = std::max<int64_t>(D->ctx_lo, pos - kCtx);
     int n_ctx = D->ctx_end == pos ? (int) (pos - lo) : 0;
@@ -821,12 +824,12 @@ bool Glm5Model::dspark_draft(int32_t y, int32_t* drafts, float* conf, std::strin
     cudaMemcpyAsync(D->dtok, D->y_h, sizeof(int), cudaMemcpyHostToDevice, s);
     float* Rc[kB];
     float* Ro[kB];
-    for (int i = 0; i < kB; ++i) {
+    for (int i = 0; i < nb; ++i) {
         Rc[i] = D->R + (size_t) i * 2 * HCE;
         Ro[i] = Rc[i] + HCE;
         gf::embed_streams(i == 0 ? D->emb_y : D->emb_noise, Rc[i], E, s);
     }
-    if (D->v41) gf::copy_floats(D->pre, D->pre_init, kB * 8, s);   // (the reads' lagged pre: stage 0 the one-hot)
+    if (D->v41) gf::copy_floats(D->pre, D->pre_init, nb * 8, s);   // (the reads' lagged pre: stage 0 the one-hot)
     const auto hc_read = [&](const DspStage& S, int i, const float* block_out, bool attn) {
         gf::HcArgs h;
         h.block_out = block_out;
@@ -860,11 +863,11 @@ bool Glm5Model::dspark_draft(int32_t y, int32_t* drafts, float* conf, std::strin
         const DspStage& S = D->st[st];
         mark();
         // ---- attention: the block's rows over the context and the whole block
-        for (int i = 0; i < kB; ++i) hc_read(S, i, st == 0 ? nullptr : D->ffn + (size_t) i * E, true);
+        for (int i = 0; i < nb; ++i) hc_read(S, i, st == 0 ? nullptr : D->ffn + (size_t) i * E, true);
         gf::MvJob j[2] = {{S.q_a.q, D->xq, D->x, D->qr_raw, nullptr, 1.0f, S.q_a.type, E, QL},
                           {S.kv.q, D->xq, D->x, D->kv_raw, nullptr, 1.0f, S.kv.type, E, DH}};
-        if (!gf::mvn(j, 2, kB, s)) { err = "dspark: q_a / kv"; return false; }
-        for (int i = 0; i < kB; ++i) {
+        if (!gf::mvn(j, 2, nb, s)) { err = "dspark: q_a / kv"; return false; }
+        for (int i = 0; i < nb; ++i) {
             ds::PrepArgs a;
             a.qr_raw = D->qr_raw + (size_t) i * QL;
             a.q_a_norm = S.q_a_norm;
@@ -884,14 +887,14 @@ bool Glm5Model::dspark_draft(int32_t y, int32_t* drafts, float* conf, std::strin
             ds::prep(a, s);
         }
         gf::MvJob jq = {S.q_b.q, D->qr_q, D->qr, D->q, nullptr, 1.0f, S.q_b.type, QL, HD};
-        if (!gf::mvn(&jq, 1, kB, s)) { err = "dspark: q_b"; return false; }
-        for (int i = 0; i < kB; ++i) {
+        if (!gf::mvn(&jq, 1, nb, s)) { err = "dspark: q_b"; return false; }
+        for (int i = 0; i < nb; ++i) {
             float* q = D->q + (size_t) i * HD;
             if (D->v41)   // (no per-head q norm)
                 d41::q_rope(q, D->nh, DH, D->rot, D->rope, nullptr, 0, 0, D->rope, (int) (pos + i), s);
             else
                 ds::q_prep(q, D->nh, DH, D->rot, D->rope, nullptr, 0, 0, D->rope, (int) (pos + i), kEps, s);
-            ds::attend(q, S.ring, kRing, 0, S.ring, D->iota + (lo % kRing), n_ctx + kB, S.sinks, D->nh, DH, D->rot,
+            ds::attend(q, S.ring, kRing, 0, S.ring, D->iota + (lo % kRing), n_ctx + nb, S.sinks, D->nh, DH, D->rot,
                        D->rope, (int) (pos + i), D->o + (size_t) i * HD, s, 0,
                        (uint8_t*) D->oq + (size_t) i * (HD / 32) * kQ8);
         }
@@ -902,31 +905,31 @@ bool Glm5Model::dspark_draft(int32_t y, int32_t* drafts, float* conf, std::strin
             jo[gi] = {(const uint8_t*) S.out_a.q + (size_t) gi * D->olr * wrow,
                       (const uint8_t*) D->oq + (size_t) gi * (gin / 32) * kQ8, D->o + (size_t) gi * gin,
                       D->oa + (size_t) gi * D->olr, nullptr, 1.0f, S.out_a.type, gin, D->olr, HD / 32, OL};
-        if (!gf::mvn(jo, D->og, kB, s)) { err = "dspark: wo_a"; return false; }
-        gf::quantize_q8_1(D->oa, D->oaq, kB * OL, s);
+        if (!gf::mvn(jo, D->og, nb, s)) { err = "dspark: wo_a"; return false; }
+        gf::quantize_q8_1(D->oa, D->oaq, nb * OL, s);
         gf::MvJob jb = {S.out_b.q, D->oaq, D->oa, D->mixer, nullptr, 1.0f, S.out_b.type, OL, E};
-        if (!gf::mvn(&jb, 1, kB, s)) { err = "dspark: wo_b"; return false; }
+        if (!gf::mvn(&jb, 1, nb, s)) { err = "dspark: wo_b"; return false; }
         // ---- the MoE
         mark();
-        for (int i = 0; i < kB; ++i) hc_read(S, i, D->mixer + (size_t) i * E, false);
+        for (int i = 0; i < nb; ++i) hc_read(S, i, D->mixer + (size_t) i * E, false);
         gf::MvJob jm[3] = {{S.gate_inp, nullptr, D->x, D->rlog, nullptr, 1.0f, gf::kTypeF32, E, NE},
                            {S.sh_gate.q, D->xq, nullptr, D->sh_g, nullptr, 1.0f, S.sh_gate.type, E, FF},
                            {S.sh_up.q, D->xq, nullptr, D->sh_u, nullptr, 1.0f, S.sh_up.type, E, FF}};
-        if (!gf::mvn(jm, 3, kB, s)) { err = "dspark: router / shared expert"; return false; }
-        if (!ds::dspark_route(D->rlog, S.probs_b, NE, K, D->wscale, S.tab, kB, D->plan_ptr, D->plan_w,
-                              D->ids_d + (size_t) st * kB * K, s)) {
+        if (!gf::mvn(jm, 3, nb, s)) { err = "dspark: router / shared expert"; return false; }
+        if (!ds::dspark_route(D->rlog, S.probs_b, NE, K, D->wscale, S.tab, nb, D->plan_ptr, D->plan_w,
+                              D->ids_d + (size_t) st * nb * K, s)) {
             err = "dspark: router";
             return false;
         }
-        gf::sh_swiglu(D->sh_g, D->sh_u, D->clamp, kB * FF, D->sh_hq, s);
+        gf::sh_swiglu(D->sh_g, D->sh_u, D->clamp, nb * FF, D->sh_hq, s);
         // the block's rows in one gate/up and one down launch (moe_gate_up_cols: a row's plan each)
-        gf::moe_gate_up_cols(D->etype, D->cols_d, kB, K, E, FF, D->clamp, D->xq, q8e, D->hq, D->hq_n, S.sh_down.q,
+        gf::moe_gate_up_cols(D->etype, D->cols_d, nb, K, E, FF, D->clamp, D->xq, q8e, D->hq, D->hq_n, S.sh_down.q,
                              S.sh_down.type, D->sh_hq, (size_t) (FF / 32) * kQ8, FF, D->sh_out, E, s);
-        gf::moe_down_cols(D->etype, D->cols_d, kB, K, E, FF, D->down_off, D->hq, D->hq_n, D->sh_out, D->ffn, E, s);
+        gf::moe_down_cols(D->etype, D->cols_d, nb, K, E, FF, D->down_off, D->hq, D->hq_n, D->sh_out, D->ffn, E, s);
     }
     // ---- the head: the last write half, the hc head, the target's output rows, the Markov chain
     mark();
-    for (int i = 0; i < kB; ++i) {
+    for (int i = 0; i < nb; ++i) {
         gf::hc_post(D->ffn + (size_t) i * E, Rc[i], D->post + i * 8, D->comb + i * 16, E, Ro[i], s);
         if (D->v41)   // (no hc head: the last FFN's pre)
             d41::head_prep(Ro[i], D->pre + i * 8 + 4, D->norm, D->eps, E, D->head_x + (size_t) i * E,
@@ -939,9 +942,9 @@ bool Glm5Model::dspark_draft(int32_t y, int32_t* drafts, float* conf, std::strin
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, D->head_xq, D->head_x, D->logits, nullptr, 1.0f, ow.type, E, V};
     if (gf::mvn_supported(ow.type)) {
-        if (!gf::mvn(&o, 1, kB, s)) { err = "dspark: output head"; return false; }
+        if (!gf::mvn(&o, 1, nb, s)) { err = "dspark: output head"; return false; }
     } else {
-        for (int i = 0; i < kB; ++i) {
+        for (int i = 0; i < nb; ++i) {
             gf::MvJob ot = o;
             ot.xq = (const uint8_t*) D->head_xq + (size_t) i * q8e;
             ot.xf = D->head_x + (size_t) i * E;
@@ -949,7 +952,7 @@ bool Glm5Model::dspark_draft(int32_t y, int32_t* drafts, float* conf, std::strin
             if (!gf::mv(&ot, 1, s)) { err = "dspark: output head (type " + std::to_string(ow.type) + ")"; return false; }
         }
     }
-    for (int i = 0; i < kB; ++i) {
+    for (int i = 0; i < nb; ++i) {
         if (D->v41)
             ds::dspark_markov_f16(D->logits + (size_t) i * V, D->markov_w2h, D->markov_w1, V, D->dtok + i, D->conf_proj,
                                   D->conf_b, D->head_h + (size_t) i * E, E, D->biased, D->conf + i, s);
@@ -959,14 +962,14 @@ bool Glm5Model::dspark_draft(int32_t y, int32_t* drafts, float* conf, std::strin
         gf::argmax(D->biased, V, D->dtok + i + 1, s);
     }
     mark();
-    cudaMemcpyAsync(D->res_tok, D->dtok + 1, kB * sizeof(int), cudaMemcpyDeviceToHost, s);
-    cudaMemcpyAsync(D->res_conf, D->conf, kB * sizeof(float), cudaMemcpyDeviceToHost, s);
-    cudaMemcpyAsync(D->res_ids, D->ids_d, (size_t) kStages * kB * K * sizeof(int), cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(D->res_tok, D->dtok + 1, nb * sizeof(int), cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(D->res_conf, D->conf, nb * sizeof(float), cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(D->res_ids, D->ids_d, (size_t) kStages * nb * K * sizeof(int), cudaMemcpyDeviceToHost, s);
     if (cudaStreamSynchronize(s) != cudaSuccess || gf::launch_errors() != D->launch_err0) {
         err = std::string("dspark: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
-    for (int i = 0; i < kB; ++i) {
+    for (int i = 0; i < nb; ++i) {
         drafts[i] = D->res_tok[i];
         conf[i] = D->res_conf[i];
     }
@@ -974,12 +977,12 @@ bool Glm5Model::dspark_draft(int32_t y, int32_t* drafts, float* conf, std::strin
     // their confidences, then each stage's routes (row-major, k a row) - for bench/v41dsp/v41_probe.py --compare
     if (D->dump != nullptr) {
         std::fprintf(D->dump, "%lld %d %d |", (long long) pos, y, n_ctx);
-        for (int i = 0; i < kB; ++i) std::fprintf(D->dump, " %d", D->res_tok[i]);
+        for (int i = 0; i < nb; ++i) std::fprintf(D->dump, " %d", D->res_tok[i]);
         std::fprintf(D->dump, " |");
-        for (int i = 0; i < kB; ++i) std::fprintf(D->dump, " %.6f", D->res_conf[i]);
+        for (int i = 0; i < nb; ++i) std::fprintf(D->dump, " %.6f", D->res_conf[i]);
         for (int st = 0; st < kStages; ++st) {
             std::fprintf(D->dump, " |");
-            for (int i = 0; i < kB * K; ++i) std::fprintf(D->dump, " %d", D->res_ids[(size_t) st * kB * K + i]);
+            for (int i = 0; i < nb * K; ++i) std::fprintf(D->dump, " %d", D->res_ids[(size_t) st * nb * K + i]);
         }
         std::fprintf(D->dump, "\n");
         std::fflush(D->dump);
@@ -994,8 +997,8 @@ bool Glm5Model::dspark_draft(int32_t y, int32_t* drafts, float* conf, std::strin
         DspStage& S = D->st[st];
         for (float& v : S.score) v *= 0.95f;
         std::vector<int> miss;
-        for (int i = 0; i < kB * K; ++i) {
-            const int e = D->res_ids[(size_t) st * kB * K + i];
+        for (int i = 0; i < nb * K; ++i) {
+            const int e = D->res_ids[(size_t) st * nb * K + i];
             if (e < 0 || e >= NE) continue;
             S.score[(size_t) e] += 1.0f;
             ++D->uses;

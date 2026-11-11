@@ -453,6 +453,10 @@ struct Glm5Model::FastState {
     float *v41_score = nullptr, *v41_bscore = nullptr;          // the index scores (ctx), the block maxima (ctx / 8)
     int* v41_bsel = nullptr;                                    // the selected candidate blocks
     unsigned char* v41_keep = nullptr;                          // the candidate mask of this token (ctx / 8)
+    int *v41_crows = nullptr, *v41_cn = nullptr;                // compact decode's ascending rows and device count
+    float* v41_cscore = nullptr;                               // compact decode scores (cand_blocks * cand_bs)
+    int64_t v41_cpos = -1;                                     // rebuilt at the candidate layer of each token
+    int v41_cvis = 0, v41_cslot = -1, v41_cnext = 24;
     float *v41_eng = nullptr, *v41_eng_h = nullptr;             // Engram rows (2 x 24 x 256 f32, device / pinned)
     unsigned int* v41_eng_flag = nullptr;                        // pinned: a table's rows landed for token v41_eng_seq
     unsigned int v41_eng_seq = 0;

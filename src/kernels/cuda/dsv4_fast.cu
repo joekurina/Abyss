@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -323,6 +324,74 @@ __global__ void __launch_bounds__(IDXM_WARPS * 32) idx_score_mma_kernel(const fl
         if (rb < n_vis) score[rb] = sb;
     }
 }
+#if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+constexpr int IDX32_HEADS = 32, IDX32_DIM = 128, IDX32_NT = 4, IDX32_KS = 8;
+constexpr int IDX32_WARPS = 8, IDX32_B = IDX32_NT * IDX32_KS * 32;
+
+// B fragments cover four tiles of eight heads. Each FP32 query is split into FP16 hi and residual lo.
+__device__ __forceinline__ void idx32_load_q(uint4* sb, float* sw, const float* q, const float* w) {
+    for (int i = threadIdx.x; i < IDX32_B; i += IDX32_WARPS * 32) {
+        const int ln = i & 31, ks = (i >> 5) & 7, nt = i >> 8;
+        const float* qn = q + (nt * 8 + (ln >> 2)) * IDX32_DIM + ks * 16 + (ln & 3) * 2;
+        const float v[4] = {qn[0], qn[1], qn[8], qn[9]};
+        __half hi[4], lo[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            hi[k] = __float2half_rn(v[k]);
+            lo[k] = __float2half_rn(v[k] - __half2float(hi[k]));
+        }
+        sb[i] = make_uint4(idx_h2(hi[0], hi[1]), idx_h2(hi[2], hi[3]),
+                          idx_h2(lo[0], lo[1]), idx_h2(lo[2], lo[3]));
+    }
+    if (threadIdx.x < IDX32_HEADS) sw[threadIdx.x] = w[threadIdx.x];
+}
+
+// A warp scores sixteen cache rows against all 32 heads, then reduces four pairs of head weights.
+__global__ void __launch_bounds__(IDX32_WARPS * 32) idx32_score_kernel(const float* __restrict__ iq,
+                                                                       const uint16_t* __restrict__ K,
+                                                                       const float* __restrict__ w, int n_vis,
+                                                                       float* __restrict__ score) {
+    __shared__ uint4 s_b[IDX32_B];
+    __shared__ float s_w[IDX32_HEADS];
+    idx32_load_q(s_b, s_w, iq, w);
+    __syncthreads();
+    const int lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
+    const int row0 = (blockIdx.x * IDX32_WARPS + (threadIdx.x >> 5)) * 16;
+    if (row0 >= n_vis) return;
+    const int ra = row0 + g, rb = ra + 8;
+    unsigned a[IDX32_KS][4];
+#pragma unroll
+    for (int ks = 0; ks < IDX32_KS; ++ks) {
+        const int c = ks * 8 + t4;
+        a[ks][0] = ra < n_vis ? reinterpret_cast<const unsigned*>(K + (size_t) ra * IDX32_DIM)[c] : 0u;
+        a[ks][1] = rb < n_vis ? reinterpret_cast<const unsigned*>(K + (size_t) rb * IDX32_DIM)[c] : 0u;
+        a[ks][2] = ra < n_vis ? reinterpret_cast<const unsigned*>(K + (size_t) ra * IDX32_DIM)[c + 4] : 0u;
+        a[ks][3] = rb < n_vis ? reinterpret_cast<const unsigned*>(K + (size_t) rb * IDX32_DIM)[c + 4] : 0u;
+    }
+    float sa = 0.0f, sb = 0.0f;
+#pragma unroll
+    for (int nt = 0; nt < IDX32_NT; ++nt) {
+        float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int ks = 0; ks < IDX32_KS; ++ks) {
+            const uint4 b = s_b[(nt * IDX32_KS + ks) * 32 + lane];
+            idx_mma16816(d, a[ks], b.x, b.y);
+            idx_mma16816(d, a[ks], b.z, b.w);
+        }
+        const float w0 = s_w[nt * 8 + t4 * 2], w1 = s_w[nt * 8 + t4 * 2 + 1];
+        sa += fmaxf(d[0], 0.0f) * w0 + fmaxf(d[1], 0.0f) * w1;
+        sb += fmaxf(d[2], 0.0f) * w0 + fmaxf(d[3], 0.0f) * w1;
+    }
+    sa += __shfl_xor_sync(0xffffffffu, sa, 1);
+    sa += __shfl_xor_sync(0xffffffffu, sa, 2);
+    sb += __shfl_xor_sync(0xffffffffu, sb, 1);
+    sb += __shfl_xor_sync(0xffffffffu, sb, 2);
+    if (t4 == 0) {
+        if (ra < n_vis) score[ra] = sa;
+        if (rb < n_vis) score[rb] = sb;
+    }
+}
+#endif
 #if defined(STRATA_USE_HIP)
 // The same scores on RDNA's WMMA (gfx11 / gfx12, wave32; HIP builds): a wave = 16 K rows x the 64 heads, K (FP16) x
 // Q^T with Q as FP16 hi + lo (two WMMAs, F32 accumulate), as idx_score_mma_kernel. Radeon 8060S (gfx1151): 1121 ->
@@ -982,6 +1051,91 @@ __global__ void __launch_bounds__(IBM_WARPS * 32) idx_score_batch_mma_kernel(con
         }
     }
 }
+#if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+constexpr int IB32_RG = 2, IB32_TT = 32, IB32_ROWS = IDX32_WARPS * IB32_RG * 16;
+
+// Keep a 256-row K tile in registers across 32 tokens. Two 16 KiB B buffers overlap query conversion and MMA.
+__global__ void __launch_bounds__(IDX32_WARPS * 32) idx32_score_batch_kernel(const float* __restrict__ iq,
+                                                                             const uint16_t* __restrict__ K,
+                                                                             const float* __restrict__ w, int ratio,
+                                                                             int p0, int T, float* __restrict__ score,
+                                                                             int ld) {
+    __shared__ uint4 s_bq[2][IDX32_B];
+    __shared__ float s_wq[2][IDX32_HEADS];
+    const int t0 = blockIdx.y * IB32_TT, j0 = blockIdx.x * IB32_ROWS;
+    const int tn = min(IB32_TT, T - t0);
+    int tf = 0;
+    while (tf < tn && (p0 + t0 + tf + 1) / ratio <= j0) ++tf;
+    if (tf >= tn) return;
+    const int lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
+    const int wrow = j0 + (threadIdx.x >> 5) * IB32_RG * 16;
+    const int nrow = (p0 + t0 + tn) / ratio;
+    unsigned a[IB32_RG][IDX32_KS][4];
+#pragma unroll
+    for (int r = 0; r < IB32_RG; ++r) {
+        const int ra = wrow + r * 16 + g, rb = ra + 8;
+#pragma unroll
+        for (int ks = 0; ks < IDX32_KS; ++ks) {
+            const int c = ks * 8 + t4;
+            a[r][ks][0] = ra < nrow ? reinterpret_cast<const unsigned*>(K + (size_t) ra * IDX32_DIM)[c] : 0u;
+            a[r][ks][1] = rb < nrow ? reinterpret_cast<const unsigned*>(K + (size_t) rb * IDX32_DIM)[c] : 0u;
+            a[r][ks][2] = ra < nrow ? reinterpret_cast<const unsigned*>(K + (size_t) ra * IDX32_DIM)[c + 4] : 0u;
+            a[r][ks][3] = rb < nrow ? reinterpret_cast<const unsigned*>(K + (size_t) rb * IDX32_DIM)[c + 4] : 0u;
+        }
+    }
+    idx32_load_q(s_bq[0], s_wq[0], iq + (size_t) (t0 + tf) * IDX32_HEADS * IDX32_DIM,
+                  w + (size_t) (t0 + tf) * IDX32_HEADS);
+    for (int i = tf; i < tn; ++i) {
+        const int buf = (i - tf) & 1;
+        __syncthreads();
+        if (i + 1 < tn)
+            idx32_load_q(s_bq[buf ^ 1], s_wq[buf ^ 1], iq + (size_t) (t0 + i + 1) * IDX32_HEADS * IDX32_DIM,
+                          w + (size_t) (t0 + i + 1) * IDX32_HEADS);
+        const int t = t0 + i, n_vis = (p0 + t + 1) / ratio;
+        if (wrow >= n_vis) continue;
+        const uint4* sb = s_bq[buf];
+        const float* sw = s_wq[buf];
+        float sa[IB32_RG], sc[IB32_RG];
+#pragma unroll
+        for (int r = 0; r < IB32_RG; ++r) sa[r] = sc[r] = 0.0f;
+#pragma unroll
+        for (int nt = 0; nt < IDX32_NT; ++nt) {
+            float d[IB32_RG][4];
+#pragma unroll
+            for (int r = 0; r < IB32_RG; ++r) d[r][0] = d[r][1] = d[r][2] = d[r][3] = 0.0f;
+#pragma unroll
+            for (int ks = 0; ks < IDX32_KS; ++ks) {
+                const uint4 b = sb[(nt * IDX32_KS + ks) * 32 + lane];
+#pragma unroll
+                for (int r = 0; r < IB32_RG; ++r) {
+                    idx_mma16816(d[r], a[r][ks], b.x, b.y);
+                    idx_mma16816(d[r], a[r][ks], b.z, b.w);
+                }
+            }
+            const float w0 = sw[nt * 8 + t4 * 2], w1 = sw[nt * 8 + t4 * 2 + 1];
+#pragma unroll
+            for (int r = 0; r < IB32_RG; ++r) {
+                sa[r] += fmaxf(d[r][0], 0.0f) * w0 + fmaxf(d[r][1], 0.0f) * w1;
+                sc[r] += fmaxf(d[r][2], 0.0f) * w0 + fmaxf(d[r][3], 0.0f) * w1;
+            }
+        }
+        float* out = score + (size_t) t * ld;
+#pragma unroll
+        for (int r = 0; r < IB32_RG; ++r) {
+            float x = sa[r], y = sc[r];
+            x += __shfl_xor_sync(0xffffffffu, x, 1);
+            x += __shfl_xor_sync(0xffffffffu, x, 2);
+            y += __shfl_xor_sync(0xffffffffu, y, 1);
+            y += __shfl_xor_sync(0xffffffffu, y, 2);
+            const int ra = wrow + r * 16 + g, rb = ra + 8;
+            if (t4 == 0) {
+                if (ra < n_vis) out[ra] = x;
+                if (rb < n_vis) out[rb] = y;
+            }
+        }
+    }
+}
+#endif
 #if defined(STRATA_USE_HIP)
 // The prompt path's scores on WMMA (HIP, gfx11 / gfx12): Q converted once (iwb_prep: each 128-float row -> 128 FP16 hi
 // + 128 FP16 lo, in place - the same 512 bytes; the indexer is its last reader), then a wave holds 2 x 16 K rows as A
@@ -1818,10 +1972,99 @@ static bool hip_wmma_arch() {
     return state[dev] == 1;
 }
 #endif
+#if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+static bool idx32_enabled() {
+    static const bool enabled = [] {
+        const char* v = getenv("STRATA_DS41_IDX32");
+        const char* old = getenv("STRATA_DS4_IDX");
+        return v && v[0] == '1' && v[1] == '\0' && !(old && std::atoi(old) == 1);
+    }();
+    return enabled;
+}
+
+bool indexer_idx32_supported(int idx_heads, int idx_dim) {
+    if (idx_heads != IDX32_HEADS || idx_dim != IDX32_DIM) return false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    static thread_local int state[64] = {};
+    if (state[dev] == 0) {
+        int major = 0, minor = 0;
+        cudaFuncAttributes decode{}, batch{};
+        const bool ok = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess &&
+                        major == 8 && minor == 0 &&
+                        cudaFuncGetAttributes(&decode, idx32_score_kernel) == cudaSuccess &&
+                        cudaFuncGetAttributes(&batch, idx32_score_batch_kernel) == cudaSuccess &&
+                        decode.ptxVersion >= 80 && batch.ptxVersion >= 80;
+        state[dev] = ok ? 1 : -1;
+    }
+    return state[dev] == 1;
+}
+
+bool indexer_scores_idx32(const float* iq, const uint16_t* K, const float* w, int idx_heads, int idx_dim,
+                          int n_vis, float* score, cudaStream_t s) {
+    if (n_vis <= 0 || !indexer_idx32_supported(idx_heads, idx_dim)) return false;
+    static thread_local bool announced = false;
+    if (!announced) {
+        std::fprintf(stderr, "deepseek41 optimization: SM80 idx32 decode score path active\n");
+        announced = true;
+    }
+    constexpr int rows = IDX32_WARPS * 16;
+    idx32_score_kernel<<<(n_vis - 1) / rows + 1, IDX32_WARPS * 32, 0, s>>>(iq, K, w, n_vis, score);
+    check("idx32_score");
+    return true;
+}
+
+bool indexer_batch_scores_idx32(const float* iq, const uint16_t* K, const float* w, int idx_heads, int idx_dim,
+                                int ratio, int p0, int T, float* score, int ld, cudaStream_t s) {
+    if (T <= 0 || ratio <= 0 || p0 < 0) return false;
+    const int64_t last = (int64_t) p0 + T;
+    if (last > std::numeric_limits<int>::max()) return false;
+    const int max_vis = (int) (last / ratio);
+    if (max_vis <= 0 || ld < max_vis || (T - 1) / IB32_TT + 1 > 65535 ||
+        !indexer_idx32_supported(idx_heads, idx_dim)) return false;
+    static thread_local bool announced = false;
+    if (!announced) {
+        std::fprintf(stderr, "deepseek41 optimization: SM80 idx32 batch score path active\n");
+        announced = true;
+    }
+    const dim3 grid((unsigned) ((max_vis - 1) / IB32_ROWS + 1), (unsigned) ((T - 1) / IB32_TT + 1));
+    idx32_score_batch_kernel<<<grid, IDX32_WARPS * 32, 0, s>>>(iq, K, w, ratio, p0, T, score, ld);
+    check("idx32_score_batch");
+    return true;
+}
+
+void indexer_scores_reference(const float* iq, const uint16_t* K, const float* w, int idx_heads, int n_vis,
+                              float* score, cudaStream_t s) {
+    if (n_vis <= 0 || idx_heads <= 0 || idx_heads > 64) return;
+    const size_t sm = (size_t) (idx_heads * 128 + idx_heads) * sizeof(float);
+    idx_score_kernel<<<(n_vis - 1) / IDX_WARPS + 1, IDX_WARPS * 32, sm, s>>>(iq, K, w, idx_heads, n_vis, score);
+    check("idx_score_reference");
+}
+
+void indexer_batch_scores_reference(const float* iq, const uint16_t* K, const float* w, int idx_heads, int ratio,
+                                    int p0, int T, float* score, int ld, cudaStream_t s) {
+    if (T <= 0 || ratio <= 0 || p0 < 0 || idx_heads <= 0 || idx_heads > 64) return;
+    const int64_t last = (int64_t) p0 + T;
+    if (last > std::numeric_limits<int>::max()) return;
+    const int max_vis = (int) (last / ratio);
+    if (max_vis <= 0 || ld < max_vis || (T - 1) / IQT + 1 > 65535) return;
+    const dim3 grid((unsigned) ((max_vis - 1) / IRT + 1), (unsigned) ((T - 1) / IQT + 1));
+    idx_score_batch_kernel<<<grid, 256, 0, s>>>(iq, K, w, idx_heads, ratio, p0, T, score, ld);
+    check("idx_score_batch_reference");
+}
+#endif
+
 void indexer(const float* iq, const uint16_t* K, const float* w, int idx_heads, int idx_dim, int n_vis, int top_k,
              float* score, int* sel, cudaStream_t s) {
     if (n_vis <= 0) return;
     (void) idx_dim;   // 128 (the kernels' layout)
+#if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+    if (idx32_enabled() && indexer_scores_idx32(iq, K, w, idx_heads, idx_dim, n_vis, score, s)) {
+        indexer_select(score, n_vis, top_k, sel, s);
+        return;
+    }
+#endif
 #if defined(STRATA_USE_HIP)
     if (idx_use_wmma(idx_heads)) {
         idx_score_wmma_kernel<<<(n_vis + IW_WAVES * 16 - 1) / (IW_WAVES * 16), IW_WAVES * 32, 0, s>>>(iq, K, w, n_vis,
@@ -1850,6 +2093,9 @@ void indexer(const float* iq, const uint16_t* K, const float* w, int idx_heads, 
 void indexer_scores(const float* iq, const uint16_t* K, const float* w, int idx_heads, int n_vis, float* score,
                     cudaStream_t s) {
     if (n_vis <= 0) return;
+#if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+    if (idx32_enabled() && indexer_scores_idx32(iq, K, w, idx_heads, 128, n_vis, score, s)) return;
+#endif
     if (idx_use_mma(idx_heads)) {
         idx_score_mma_kernel<<<(n_vis + IDXM_WARPS * 16 - 1) / (IDXM_WARPS * 16), IDXM_WARPS * 32, 0, s>>>(iq, K, w, n_vis,
                                                                                                          score);
@@ -2009,6 +2255,12 @@ void indexer_batch(float* iq, const uint16_t* K, const float* w, int idx_heads, 
                    float* score, int ld, int* sel, cudaStream_t s) {
     const int max_vis = (p0 + T) / ratio;
     if (T <= 0 || max_vis <= 0) return;
+#if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+    if (idx32_enabled() && indexer_batch_scores_idx32(iq, K, w, idx_heads, 128, ratio, p0, T, score, ld, s)) {
+        indexer_batch_select(score, ld, ratio, p0, T, top_k, sel, top_k, s);
+        return;
+    }
+#endif
 #if defined(STRATA_USE_HIP)
     if (idx_use_wmma(idx_heads)) {
         iwb_prep_kernel<<<(unsigned) ((T * 64 + 7) / 8), 256, 0, s>>>(iq, T * 64);
@@ -2037,6 +2289,9 @@ void indexer_batch_scores(float* iq, const uint16_t* K, const float* w, int idx_
                           float* score, int ld, cudaStream_t s) {
     const int max_vis = (p0 + T) / ratio;
     if (T <= 0 || max_vis <= 0) return;
+#if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+    if (idx32_enabled() && indexer_batch_scores_idx32(iq, K, w, idx_heads, 128, ratio, p0, T, score, ld, s)) return;
+#endif
 #if defined(STRATA_USE_HIP)
     // deepseek41's 32 heads on WMMA too (v1.3.63; iq is converted in place, as indexer_batch does: these rows' last
     // reader).  (The CUDA mma kernel is 64 heads: the plain one below.)

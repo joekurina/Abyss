@@ -778,7 +778,7 @@ public:
     /// cache's copies the last draft planned - after the window is queued, so they run under it.
     bool dspark_ready() const { return dsp_ != nullptr || dfl_ != nullptr || chain_mtp_on(); }
     bool dflash_on() const { return dfl_ != nullptr; }   // DFlash2 (dflash2.cu): its walk applied the threshold
-    bool dspark_draft(int32_t y, int32_t* drafts, float* conf, std::string& err);
+    bool dspark_draft(int32_t y, int32_t* drafts, float* conf, std::string& err, int rows = -1);
     void dspark_upload();
     void dspark_report() const;
     bool decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
@@ -814,6 +814,7 @@ public:
     // layer, and a layer that is no index source reads the selection the last index source made for the same row)
     int* pf_sel_ = nullptr;
     unsigned char* pf_keep_ = nullptr;
+    uint32_t* pf_keep_bits_ = nullptr;    // prompt-only bitset layout, selected at process startup
     size_t prefill_v41_row() const;   // those two per row, in bytes (0: not deepseek41)
     bool prefill_setup(std::string& err);                  // in fast_setup: sizes, host buffers (no device memory)
     size_t prefill_borrow_bytes() const;                   // device bytes the prompt path borrows from the pool's tail
