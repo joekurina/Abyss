@@ -4646,6 +4646,38 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     if (prefill_logits && (!g_.v41 || split_next_ || l0_ != 0 || l1_ != g_.n_layers)) {
         err = "prefill logits requires single-device DeepSeek V4.1"; return false;
     }
+    // A prompt shares the link with the decode path's background tier moves (STRATA_GLM_BG_LANE /
+    // bg_pace). One left over from the previous answer competes with the prompt's staging and
+    // serializes it: measured on a 128K prompt that follows 32K and 64K, 139.0 s with them running
+    // against 102.7 s with them off, with the host lane's work identical in both (96.9 s, 695 k rows).
+    // Hold new moves for the prompt and land the queued ones before the first chunk borrows, so the
+    // prompt starts against a quiet link. STRATA_GLM_BG_PREFILL_HOLD=0: the old behaviour (A/B).
+    static const bool bg_prefill_hold = [] {
+        const char* v = getenv("STRATA_GLM_BG_PREFILL_HOLD");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    struct BgHoldForPrompt {
+        Glm5Model* self;
+        bool armed = false;
+        ~BgHoldForPrompt() {
+            if (!armed) return;
+            for (Glm5Model* m = self; m != nullptr; m = m->split_next_.get())
+                if (m->fast_ != nullptr) m->fast_->bg_hold = false;
+        }
+    } bg_hold_guard{this, false};
+    if (bg_prefill_hold) {
+        bg_hold_guard.armed = true;
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+            FastState* F = m->fast_;
+            if (F == nullptr) continue;
+            cudaSetDevice(m->dev_);
+            F->bg_hold = true;                                    // no new moves while this prompt runs
+            F->bg_drain(nullptr, (size_t) -1, 3, F->copy2);       // what the last answer left queued
+            cudaStream_t used = F->copy2 != nullptr ? F->copy2 : F->copy;
+            if (used != nullptr) cudaStreamSynchronize(used);      // ... lands before the first chunk
+        }
+        cudaSetDevice(dev_);
+    }
     // the chunk for this prompt: no bigger than it needs (rounded up to 64), so it borrows only that much; a prompt
     // longer than the largest chunk is cut into EQUAL chunks (the parts of a split pipeline chunks)
     int Tmax = pf_->T;
