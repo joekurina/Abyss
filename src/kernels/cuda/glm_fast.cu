@@ -801,7 +801,7 @@ __device__ __forceinline__ uint4 direct_signs(unsigned b, bool parity) {
 }
 __device__ __forceinline__ uint2 quant_load8(const void* p) {
     uint2 words;
-    __builtin_memcpy(&words, p, sizeof(words)); // GGUF super-blocks are only 2-byte aligned.
+    memcpy(&words, p, sizeof(words));   // GGUF super-blocks are only 2-byte aligned (memcpy: MSVC has no __builtin_memcpy, #39)
     return words;
 }
 template<int T> constexpr int sign_count = T == 22 ? 256 : 128;
@@ -2955,6 +2955,7 @@ struct RouteArgs {
                                 // only); a VRAM one gets the larger of the two.  LOSSY (0: off)
     int prof;                   // STRATA_GLM_ROUTE_PROF: per-phase cycle sums (diagnostics)
     int win_more;               // MoeRequest::win_more (a batched verify window's column: more routes of the layer follow)
+    int topk_par;               // 1: the top-k by ranks over the block (block_topk512, the same ids); STRATA_GLM_TOPK_PAR=0: warp 0's
 };
 // the request's xq (x's q8_1 as the device computed it: 36-byte blocks, copied as words) and its flag; the system
 // fence before the request's seq covers it as it does x
@@ -3056,6 +3057,107 @@ __device__ void warp_topk(const float* sel, int E, int k, int* out) {
 #else
     warp_topk_scan(sel, E, k, out);
 #endif
+}
+
+// ... the same selection by ranks, the whole route block (E <= 512): warp_topk's order is one total order - the higher
+// key first, the lower index on a tie - so its r-th pick is the entry exactly r others beat.  A: each entry's rank
+// within its 64-entry slice (64 compares); the k best of a slice go to candidate slot (slice, rank).  B: each
+// candidate's rank among the candidates - the k best of all are among their slices' k best, and every entry that
+// beats one of them is too, so that rank is its rank of all - and a rank r < k with a key above -inf's writes out[r];
+// the rest stay -1 (warp_topk's -1 for -inf / none).  No serial rounds: warp_topk's k rounds of two warp reductions
+// were ~9k cycles a route on an RTX 5090 (Qwen3.8 k = 10 of 512, STRATA_GLM_ROUTE_PROF); alone (topk_parity) 7.2k ->
+// 4.0k cycles (k 8: 5.9k -> 3.7k).  Every thread calls it (it syncs); cand: 8 kMaxK words of shared memory
+// (an entry as one 64-bit word: its key above, ~index below - "beats" is then one unsigned compare)
+__device__ __forceinline__ void block_topk512(const float* sel, int E, int k, int* out, unsigned long long* cand) {
+#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    __shared__ __align__(16) unsigned long long s_c[512];
+    const int tid = threadIdx.x;
+    for (int e = tid; e < 512; e += blockDim.x)
+        s_c[e] = e < E ? ((unsigned long long) topk_key(sel[e]) << 32) | (0xffffffffu - (unsigned) e) : 0ull;
+    for (int c = tid; c < 8 * kMaxK; c += blockDim.x) cand[c] = 0ull;
+    if (tid < k) out[tid] = -1;
+    __syncthreads();
+    for (int e = tid; e < E; e += blockDim.x) {
+        const unsigned long long ce = s_c[e];
+        const int s0 = e & ~63, s1 = min(s0 + 64, E);
+        int r = 0;
+        if (s1 - s0 == 64) {
+            const ulonglong2* c2 = (const ulonglong2*) (s_c + s0);
+#pragma unroll
+            for (int q = 0; q < 32; ++q) {
+                const ulonglong2 v = c2[q];
+                r += (v.x > ce ? 1 : 0) + (v.y > ce ? 1 : 0);
+            }
+        } else {
+            for (int j = s0; j < s1; ++j) r += s_c[j] > ce ? 1 : 0;
+        }
+        if (r < k) cand[(e >> 6) * k + r] = ce;   // (slot (slice, rank), k a slice)
+    }
+    __syncthreads();
+    const int nc = 8 * k;   // (an empty slot is 0: below every entry, and skipped)
+    for (int c = tid; c < nc; c += blockDim.x) {
+        const unsigned long long cc = cand[c];
+        if (cc == 0ull) continue;
+        int r = 0;
+        const ulonglong2* c2 = (const ulonglong2*) cand;
+#pragma unroll 8
+        for (int q = 0; q < nc / 2; ++q) {
+            const ulonglong2 v = c2[q];
+            r += (v.x > cc ? 1 : 0) + (v.y > cc ? 1 : 0);
+        }
+        if (nc & 1) r += cand[nc - 1] > cc ? 1 : 0;
+        if (r < k && (unsigned) (cc >> 32) > 0x007fffffu) out[r] = (int) (0xffffffffu - (unsigned) cc);
+    }
+    __syncthreads();
+#else
+    if (threadIdx.x < 32) warp_topk(sel, E, k, out);
+    __syncthreads();
+    (void) cand;
+#endif
+}
+
+// (route_topk_check: block_topk512 against warp_topk on n patterns of E scores a block, k = 1..16)
+__global__ void __launch_bounds__(ROUTE_THREADS) topk_check_kernel(const float* sel, const int* Es, int* bad) {
+    __shared__ float s[512];
+    __shared__ int o1[kMaxK], o2[kMaxK];
+    __shared__ __align__(16) unsigned long long cand[8 * kMaxK];
+    const int E = Es[blockIdx.x];
+    for (int e = threadIdx.x; e < 512; e += ROUTE_THREADS) s[e] = sel[(size_t) blockIdx.x * 512 + e];
+    __syncthreads();
+    for (int k = 1; k <= kMaxK; ++k) {
+        if (threadIdx.x < 32) warp_topk(s, E, k, o1);
+        __syncthreads();
+        block_topk512(s, E, k, o2, cand);
+        if (threadIdx.x == 0)
+            for (int i = 0; i < k; ++i)
+                if (o1[i] != o2[i]) atomicAdd(bad, 1);
+        __syncthreads();
+    }
+}
+
+// (route_topk_time: SM cycles of one k-of-E selection each way, the mean over reps, block 0's thread 0)
+template <int MODE>
+__global__ void __launch_bounds__(ROUTE_THREADS) topk_time_kernel(const float* sel, int E, int k, int reps,
+                                                                 unsigned long long* cyc) {
+    __shared__ float s[512];
+    __shared__ int o[kMaxK];
+    __shared__ __align__(16) unsigned long long cand[8 * kMaxK];
+    for (int e = threadIdx.x; e < 512; e += ROUTE_THREADS) s[e] = sel[e];
+    __syncthreads();
+    unsigned long long t = 0;
+    for (int r = 0; r < reps; ++r) {
+        __syncthreads();
+        const unsigned long long t0 = clock64();
+        if (MODE == 0) {
+            if (threadIdx.x < 32) warp_topk(s, E, k, o);
+            __syncthreads();
+        } else {
+            block_topk512(s, E, k, o, cand);
+        }
+        t += clock64() - t0;
+        if (threadIdx.x == 0) s[r & 511] += o[0] < 0 ? 1e-30f : 0.0f;   // (keep the work)
+    }
+    if (threadIdx.x == 0) *cyc = t / (unsigned long long) reps;
 }
 
 // STRATA_GLM_ROUTE_PROF=1 (diagnostics, CUDA): thread 0 of the route block sums SM cycles per phase (0 start, 1 x / prev
@@ -3180,8 +3282,13 @@ __device__ __forceinline__ void route_body(const RouteArgs& a, unsigned int* syn
         if (tid < a.k) s_ids[tid] = a.hash_ids[tid];
         __syncthreads();
     } else if (E <= 512) {
-        if (tid < 32) warp_topk(s_sel, E, a.k, s_ids);
-        __syncthreads();
+        if (a.topk_par) {
+            __shared__ __align__(16) unsigned long long s_cand[8 * kMaxK];
+            block_topk512(s_sel, E, a.k, s_ids, s_cand);
+        } else {
+            if (tid < 32) warp_topk(s_sel, E, a.k, s_ids);
+            __syncthreads();
+        }
     } else {
         topk_argmax(s_sel, E, a.k, s_ids, s_bv, s_bi);
     }
@@ -3701,7 +3808,9 @@ __device__ __forceinline__ void cpu_wait_add(const unsigned int* cpu_seq, const 
             }
             __threadfence_system();
         }
-        s_xm = ((volatile const CpuAnswer*) r)->xmask;
+        // xmask only for the exact combine (another PCIe read a block, after the wait - issue #42: it ran on every
+        // wait from v1.3.127 on, the exact combine being off on HIP by default)
+        s_xm = xp != nullptr && k > 0 ? ((volatile const CpuAnswer*) r)->xmask : 0u;
 #else
         // seq and xmask in one 16-byte read (the host writes xmask, then its release fence, then seq: a read that
         // sees the new seq sees the new xmask) - a PCIe round trip less than reading xmask after
@@ -4906,6 +5015,24 @@ bool mvn(const MvJob* jobs, int n, int nc, cudaStream_t s) {
 void mv_force_q6k_split(int split4) { g_q6k_force.store(split4); }
 void mv_force_split(int split) { g_split_force.store(split == 2 || split == 4 || split == 1 ? split : -1); }
 bool mv_q6k_split_choice() { return mv_tune().q6k_split; }
+int mv_split_rule(int type, int n_out) {
+    // (mv()'s rule below, for one type's blocks acc; HIP's mixed-type launch is another order: no rule there)
+#if defined(STRATA_USE_HIP)
+    (void) type; (void) n_out;
+    return 0;
+#else
+    if (getenv("STRATA_GLM_MV_GENERIC") != nullptr) return 0;
+    if (type != 14 && type != 8 && type != 12 && type != 13) return 0;
+    static const int split_env = [] { const char* v = getenv("STRATA_GLM_MV_SPLIT"); return v ? std::atoi(v) : -1; }();
+    const int q6k_force = g_q6k_force.load(std::memory_order_relaxed);
+    const bool q6k_split = q6k_force >= 0 ? q6k_force != 0 : mv_tune().q6k_split;
+    const int acc = (n_out + MV_ROWS - 1) / MV_ROWS;
+    const int sforce = g_split_force.load(std::memory_order_relaxed);
+    return sforce > 0 ? sforce
+         : split_env >= 0 ? (split_env == 2 || split_env == 4 ? split_env : 1)
+         : (acc < 256 || (q6k_split && type == 14 && acc <= 4096)) ? 4 : 1;
+#endif
+}
 
 bool mvn_mv(const MvJob* jobs, int n, int nc, cudaStream_t s) {
     if (nc == 1) return mv(jobs, n, s);
@@ -5569,6 +5696,19 @@ __global__ void sh_swiglu_kernel(const float* __restrict__ sh_gate, const float*
     q8_1_store_warp((g / (1.0f + expf(-g))) * u, sh_hq + i / 32, threadIdx.x & 31);
 }
 
+int route_topk_check(const float* sel_d, const int* E_d, int n, int* bad_d, cudaStream_t s) {
+    topk_check_kernel<<<n, ROUTE_THREADS, 0, s>>>(sel_d, E_d, bad_d);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+void route_topk_time(const float* sel_d, int E, int k, int reps, unsigned long long* cyc_d, cudaStream_t s) {
+    topk_time_kernel<0><<<1, ROUTE_THREADS, 0, s>>>(sel_d, E, k, reps, cyc_d);
+    topk_time_kernel<1><<<1, ROUTE_THREADS, 0, s>>>(sel_d, E, k, reps, cyc_d + 1);
+}
+// STRATA_GLM_TOPK_PAR (default 1): the route's top-k by ranks over the block (block_topk512: the same ids); 0: warp 0 alone
+static int route_topk_par() {
+    static const int v = [] { const char* e = getenv("STRATA_GLM_TOPK_PAR"); return e == nullptr || std::atoi(e) != 0 ? 1 : 0; }();
+    return v;
+}
 void sh_swiglu(const float* sh_gate, const float* sh_up, float sh_limit, int n_ff_sh, void* sh_hq, cudaStream_t s) {
     pdl_launch(sh_swiglu_kernel, (n_ff_sh + ROUTE_THREADS - 1) / ROUTE_THREADS, ROUTE_THREADS, 0, s, sh_gate, sh_up, sh_limit,
                                                                                             n_ff_sh, (block_q8_1*) sh_hq);
@@ -5598,6 +5738,7 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
     static const int prof = [] { const char* v = getenv("STRATA_GLM_ROUTE_PROF"); return v != nullptr && std::atoi(v) != 0; }();
     a.prof = prof;
     a.win_more = win_more;
+    a.topk_par = route_topk_par();
     // STRATA_GLM_ROUTE_EARLY=1: x written at the route kernel's start (float4, beside the scores and the plan);
     // default 0: after the plan, as before - measured the same on an RTX 5090 + iGPU lane (the system fence, not the
     // store, is what the request waits for): 3 x 2 answers, 83.4 / 85.6 against 83.6 / 91.2 tok/s
@@ -5638,6 +5779,7 @@ bool moe_route_cols(const float* logits, size_t logit_stride, const float* bias,
                     pf_rank > 0 ? pf_rank : k, gating, nullptr, skip_w, 0, skip_disk, nullptr, 0.0f, 0.0f};
     c.a.n_embd = (int) x_stride;   // (a column's x: n_embd floats)
     c.a.prof = prof;
+    c.a.topk_par = route_topk_par();
     c.nc = nc;
     c.sync = sync;
     for (int t = 0; t < nc; ++t) {
@@ -6338,5 +6480,90 @@ void argmax(const float* x, int n, int* out, cudaStream_t s) {
     argmax_kernel<<<1, 1024, 0, s>>>(x, n, out);
     launch_check("argmax");
 }
+
+// argmax_kernel's selection (the largest value, the lowest index among equal ones, NaN never taken) split over
+// blocks: each block's best of its contiguous range, the last block to finish (a ticket) picks among the blocks'.
+// The rule is a total order on (value, -index) over the non-NaN entries, so the pick does not depend on how the
+// entries were grouped: the same index as argmax_kernel.  One block read the ~1 MB vocabulary at ~60 GB/s (17 us).
+constexpr int kAmBlocks = 128;
+__global__ void __launch_bounds__(256) argmax_mb_kernel(const float* __restrict__ x, int n, int* __restrict__ out,
+                                                        float* __restrict__ pv, int* __restrict__ pi,
+                                                        unsigned int* __restrict__ ticket) {
+    __shared__ float sv[8];
+    __shared__ int si[8];
+    __shared__ bool last;
+    float best = -INFINITY;
+    int bi = 0x7fffffff;
+    const auto take = [&](float v, int i) {
+        if (v > best || (v == best && i < bi)) {
+            best = v;
+            bi = i;
+        }
+    };
+    const int n4 = n >> 2;   // (x is 16-byte aligned: the caller checks)
+    const int per = (n4 + gridDim.x - 1) / gridDim.x;
+    const int a0 = blockIdx.x * per, a1 = min(n4, a0 + per);
+    const float4* x4 = (const float4*) x;
+    for (int i = a0 + threadIdx.x; i < a1; i += blockDim.x) {
+        const float4 a = x4[i];
+        take(a.x, 4 * i);
+        take(a.y, 4 * i + 1);
+        take(a.z, 4 * i + 2);
+        take(a.w, 4 * i + 3);
+    }
+    if (blockIdx.x == gridDim.x - 1)
+        for (int i = 4 * n4 + threadIdx.x; i < n; i += blockDim.x) take(x[i], i);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+        if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
+    }
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    if (lane == 0) { sv[w] = best; si[w] = bi; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int i = 1; i < (int) (blockDim.x >> 5); ++i)
+            if (sv[i] > best || (sv[i] == best && si[i] < bi)) { best = sv[i]; bi = si[i]; }
+        pv[blockIdx.x] = best;
+        pi[blockIdx.x] = bi;
+        __threadfence();
+        last = atomicAdd(ticket, 1u) == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    best = -INFINITY;
+    bi = 0x7fffffff;
+    for (int b = threadIdx.x; b < (int) gridDim.x; b += blockDim.x) take(((const volatile float*) pv)[b], ((const volatile int*) pi)[b]);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+        if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
+    }
+    __syncthreads();
+    if (lane == 0) { sv[w] = best; si[w] = bi; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int i = 1; i < (int) (blockDim.x >> 5); ++i)
+            if (sv[i] > best || (sv[i] == best && si[i] < bi)) { best = sv[i]; bi = si[i]; }
+        *out = bi;
+        *ticket = 0u;   // (the next launch on this stream starts from zero)
+    }
+}
+
+void argmax_mb(const float* x, int n, int* out, void* scratch, cudaStream_t s) {
+    if (scratch == nullptr || (((uintptr_t) x) & 15u) != 0 || n < 4 * kAmBlocks * 256) {
+        argmax(x, n, out, s);
+        return;
+    }
+    float* pv = (float*) scratch;
+    int* pi = (int*) (pv + kAmBlocks);
+    unsigned int* ticket = (unsigned int*) (pi + kAmBlocks);
+    argmax_mb_kernel<<<kAmBlocks, 256, 0, s>>>(x, n, out, pv, pi, ticket);
+    launch_check("argmax_mb");
+}
+size_t argmax_mb_scratch_bytes() { return (size_t) kAmBlocks * 8 + 16; }
 
 }  // namespace strata::kernels::glmf

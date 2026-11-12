@@ -508,7 +508,10 @@ Radeon 8060S（gfx1151）。
   `/opt/rocm`（または `/opt/rocm/core-10.0`）の ROCm 10 を使う。HIP 7.14 以降が要り、ROCm 7.0〜7.2 では止まる。この
   2 つはいまのドライバと組み合わせると失敗するため（issue #1、#8。`ABYSS_OLD_ROCM=1` でそれでもビルドできる）。
   エンジンは `build-hip/strata` にビルドされ、設定に `"backend": "hip"` が入る。別の ROCm に切り替えたら、
-  `ROCM_PATH` を付けてもう一度実行する。その ROCm でエンジンを最初からビルドし直す（v1.3.44）。
+  `ROCM_PATH` を付けてもう一度実行する。その ROCm でエンジンを最初からビルドし直す（v1.3.44）。Windows で
+  Visual Studio の MSVC が 14.50 以降なら、セットアップが ROCm SDK の `__clang_hip_runtime_wrapper.h` の include を
+  1 行移す（「'isgreater' cannot overload」への LLVM の修正。issue #43。元は `.abyss-orig` として残る）。
+  `ABYSS_NO_ROCM_HEADER_FIX=1` で SDK に手を付けない。
 - **ドライバと ROCm:** 入れ方は [docs/amd/README.ja.md](amd/README.ja.md) にまとめた（amdgpu、ROCm 10 の
   アーキテクチャ別のパッケージ、`HSA_OVERRIDE_GFX_VERSION` を設定してはいけない理由）。動作確認とトラブル対応も
   そこにある。R9700 では `amdrocm10.0-gfx1201` が要る。
@@ -637,6 +640,10 @@ v1.3.74 から、エンジンは Qwen3.8-Flash-Next（llama.cpp の `qwen4exp`�
   3.83 個の下書きのうち 3.62 個が当たり。参照は 3.79 個のうち 3.59 個）。
   1 回の下書きは 1 つの CUDA グラフで動く（RTX 5090 で 1.14 ms、前は 1.96 ms）。`STRATA_Q4X_DFLASH_GRAPH=0` でカーネルを 1 つずつ
   起動する（下書きは同じ）。
+  PCIe が詰まりやすいカードでは引き分け: RTX 4090 + 96 GB、UD-Q4_K_XL そのまま（greedy、長いコード生成 8K トークン）で、
+  MTP 層が 55.6 tok/s、DFlash 2 が 56.4 tok/s。下書きの採用率は DFlash 2 が 86〜89%、MTP が 78% と差があっても、速さはほぼ
+  同じでした（#39）。ここでは生成が PCIe 越しのエキスパート読み込みを待っている（`vram hit` 約 60%、1 トークンあたり RAM から
+  約 20 回）ので、よいドラフターで 1 回の検証窓から出るトークンが増えても、窓ごとのエキスパート読み込みは変わりません。
 
 ## Ornith-1.5-122B
 
@@ -657,6 +664,8 @@ llama.cpp の `qwen35moe`）も動かします。gated delta-net 層 36 + full a
   （iGPU なしでは コード 36 → 42、散文 33 → 39）。
 - **NVIDIA:** RTX 5090 で、IQ3_XXS-B は NextN ドラフターありで 116 tok/s（75% が採用、v1.3.100）。エキスパートの置き場を
   1.45 GB にしたとき（issue #23 の 8 GB のカード）は、プロンプトが 356 tok/s（2K）、デコードが 45.5 tok/s（v1.3.82）。
+- **VRAM が少ないとき:** `--kv q4_0`（または `k8v4`、`int8`）で attention のキャッシュが fp16 の 28%（41%、53%）になり、
+  残りはエキスパートの置き場に回ります（v1.3.134、#44）。Ornith-1.5-397B を 128K の文脈で 16 GB のカードでも起動できます。設定項目の `--kv` を参照。
 - **まだないもの:** 会話スロット、レイヤー分割、画像。エキスパートカーネルはこの形状にまだ調整していない。
 
 ## EXL3 量子化（GLM-5.3-Flash）
@@ -708,7 +717,8 @@ prompt は ubatch 512 で 78 tok/s、ubatch 8192 で 660 tok/s。）各リリー
 で読める（CPU のスレッドは約 75 GB/s）。ROCm が入っていて `libabyss_igpu.so` がビルドされていれば、エンジンは
 起動時に RAM 層を内蔵 GPU に登録し、RAM 層のエキスパートを CPU の代わりに内蔵 GPU で計算する（コピーはしない）。
 どちらで計算するかは起動時に両方を測って決め、ログに出す（`iGPU lane: an expert 0.046 ms vs 0.107 on the CPU's
-16 threads`）。CPU のほうが速い場合や、ライブラリか HIP のデバイスがない場合は CPU で計算する。
+16 threads`）。内蔵 GPU がはっきり速くない場合（1.5 倍、`STRATA_GLM_IGPU_MARGIN`）、正確な合算が有効な場合（Qwen3.8）、
+ライブラリか HIP のデバイスがない場合は CPU で計算する。
 prompt のまとめ処理でもこのレーンを使う。prompt のチャンクが必要とする RAM 層のエキスパートを、CPU のスレッドではなく
 内蔵 GPU で計算する（8K の prompt で +40%）。レーンの呼び出しには期限がある（`STRATA_GLM_IGPU_TIMEOUT_MS`、20 ms）。
 カーネルドライバが内蔵 GPU のキューを止めているとき（起動後の数分間、読み込みのあとにカーネルがメモリを回収する間に
@@ -803,13 +813,16 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_GLM_RAM_GB` | 空き RAM から | pinned の RAM 層の大きさを GB で固定。大きくすると SSD の待ちは減るが、そのエキスパートは CPU のレーンが計算する。DDR4 のデスクトップの V4.1 で 80 → 88 GB にすると SSD の待ち 11.1 → 8.7 ms、レーン 9.4 → 10.6 ms、生成 +3%（docs/BENCH） |
 | `STRATA_GLM_EXPERT_HELPER` / `_GIB` | オフ / 13 GiB | DeepSeek V4.1、CUDA のみ: 2 枚目の GPU の番号（例 `1`）と、そこに常駐させるデコード用エキスパートの置き場の大きさ。`0` でオフ。プロンプトは 1 枚目のまま。GPU が無い、置き場が入らない、ヘルパーでエラーが出たときは CPU で計算します。分割しない native pack と CPU レーンが必要で、レイヤーグラフはオフのとき。DSpark の検証窓でも使います（v1.3.94）。[設定と制限（英語）](EXPERT_HELPER.md) |
 | `STRATA_GLM_RAM_HEADROOM_GB` | 6（ユニファイドメモリでは 16） | RAM 層を決めるとき、システムのために空けておく RAM。AMD のセットアップは config に 16 を書く |
-| `STRATA_GLM_RAM_FRAC` | 0.73 | Linux・単体 GPU で `STRATA_GLM_RAM_GB` がないとき、RAM 層が pin する RAM の上限 (全体に対する割合)。94 GB 機で 73% を超えて pin するとスラッシングした。0.05〜0.95 に収める（上限を外す値はログに一行出して丸める） |
+| `STRATA_GLM_RAM_FRAC` | 0.73 | Linux・単体 GPU で `STRATA_GLM_RAM_GB` がないとき、RAM 層が pin する RAM の上限は「RAM 全体のこの割合」と「RAM 全体から `STRATA_GLM_RAM_KEEP_GB` を引いた量」の大きいほう（RAM が 100 GiB 以上の機械だけ。それより小さい機械は今までどおり割合だけ）。94 GB 機で 73% を超えて pin するとスラッシングした。これだけを設定すると割合だけで上限を決める（KEEP より前の動き）。0.05〜0.95 に収める（上限を外す値はログに一行出して丸める） |
+| `STRATA_GLM_RAM_KEEP_GB` | 24 | Linux・単体 GPU で `STRATA_GLM_RAM_GB` がないとき、RAM 全体のうち RAM 層に使わずに残す量。ページキャッシュ（シャードや V4.1 の Engram 表）、サーバー、デスクトップのぶんで、RAM が大きくても増えないため、RAM が 100 GiB 以上の機械では 73% より多く pin する。RAM 123.5 GiB で上限 90.2 → 99.5 GB（RTX 5090 の DeepSeek V4.1 UD-IQ2_XXS は生成 30.2 → 34.5 tok/s）、251 GiB で 227 GB。64 / 96 GB の機械（62.5 / 94 GiB）は今までどおり 73%（45.6 / 68.6 GB）で、この変数を設定したときだけ KEEP を使う。エンジンの起動後にほかのアプリが 8 GB より多く増える使い方（重いデスクトップ、タブの多いブラウザなど）では `32` を設定する。空き RAM から `STRATA_GLM_RAM_HEADROOM_GB` を引いた量も超えない。どちらで決まったかはログの `RAM tier ... pinned` の行に出る |
 | `STRATA_GLM_STREAM_FETCH` | オン | SSD から読んだエキスパートを、読めた塊から順に VRAM へコピーする。PCIe のコピーが SSD の読みのすぐ後ろを走る（v1.3.31。DeepSeek V4.1 で 1 トークン −9%）。`0` で読み終わってからまとめてコピー |
 | `STRATA_GLM_RAM_THP` | オン（Linux） | RAM 層を透過的ヒュージページに置く（空きの 2 MB ブロックの範囲で。APU のレーンが再検証するページが 512 分の 1 になり、数秒の停止が消える）。`0` でドライバの pinned ページ |
-| `STRATA_GLM_RESERVE_MB` | 1536。12 GB 以下の CUDA カードは 700 | エキスパート用プールの横に空けておく VRAM。CUDA も v1.3.82 から 12 GB を超えるカードでは 1536 です。RTX 5090 で DeepSeek V4.1 を `--max-context 65536` で動かすと、700 では attention と DSpark ドラフタのバッファで VRAM が足りなくなっていました。HIP は v1.3.68 から多めに空けます。最初のプロンプトのときに hipBLASLt の GEMM がカーネルを読み込み（約 0.7 GB）、0.7 GB の空きでは R9700 で `--max-context 131072` のときに読み込めず、プロンプトの GEMM がすべて失敗して 8K のプロンプトに 1,300 秒かかっていました。プールが小さくなる分、生成は約 3% 遅くなります |
+| `STRATA_GLM_RESERVE_MB` | 1536。12 GB 以下の CUDA カードと、CUDA の Qwen3.8 は 700 | エキスパート用プールの横に空けておく VRAM。CUDA の Qwen3.8 は v1.3.132 からどのカードでも 700 です（DSpark がなく、プロンプトはプールから借りるため）。RTX 5090 でエキスパートの枠が 432 増え、4K + 512 の生成はドラフタなし 113.9 -> 121.1 tok/s、MTP 167.7 -> 175.7。CUDA も v1.3.82 から 12 GB を超えるカードでは 1536 です。RTX 5090 で DeepSeek V4.1 を `--max-context 65536` で動かすと、700 では attention と DSpark ドラフタのバッファで VRAM が足りなくなっていました。HIP は v1.3.68 から多めに空けます。最初のプロンプトのときに hipBLASLt の GEMM がカーネルを読み込み（約 0.7 GB）、0.7 GB の空きでは R9700 で `--max-context 131072` のときに読み込めず、プロンプトの GEMM がすべて失敗して 8K のプロンプトに 1,300 秒かかっていました。プールが小さくなる分、生成は約 3% 遅くなります。エンジンのフラグ `--vram-reserve-mib N`（設定の `args` に書く）は、どのモデルでも同じ空きを決めます。GLM-5.3 / Qwen3.8 / DeepSeek V4.1 のプールにも、古い qwen4exp の経路の `--expert-cache auto` にも効きます。v1.3.129 までは、このプールではフラグが無視されていました（#39）。両方を指定したときはフラグが優先です（この環境変数はセットアップがマシンごとの既定として書くもので、フラグは設定そのものの指定だから。ログに `NOTE: --vram-reserve-mib N overrides STRATA_GLM_RESERVE_MB=M` と出ます） |
+| `--kv q4_0` / `k8v4` / `int8`（エンジンのフラグ。設定の `args` に書く） | `fp16` | Ornith-1.5 122B / 397B（`qwen35moe`、v1.3.134 から）: attention 層の K/V キャッシュを小さくし、空いた VRAM をエキスパートの置き場に回します。`q4_0` はアダマール回転のあと 4 ビット（fp16 の 28%）、`k8v4` は K を 8 ビット・V を 4 ビット（41%）、`int8` は 8 ビット（53%）。`--max-context 131072` のとき Ornith-1.5-397B のキャッシュは fp16 で 4.00 GB、q4_0 / k8v4 / int8 で 1.12 / 1.62 / 2.12 GB。16 GB のカードでは fp16 は `not enough VRAM for the expert pool` で止まり、3 つとも起動します（#44）。Ornith-1.5-122B（NextN ドラフターあり）は 3.25 → 0.91 GB（q4_0）。fp16 との KL（122B 24G64G、8K / 32K の文脈のあと 511 トークン）: q4_0 0.019 / 0.007（1 位のトークンが同じ割合 93.9% / 98.8%）、k8v4 0.013 / 0.005、int8 0.008 / 0.003。日本語の 8K の文脈のあとでは q4_0 0.031（1 位が同じ 91.6%）、k8v4 0.021、int8 0.014 で、nll は fp16 との差が 0.005 以内です。速さ（RTX 5090、122B 24G64G、NextN ドラフターあり）: 32 GB では生成は 4K〜64K で fp16 と同じ、プロンプトは 32K〜64K で 5〜9% 遅くなります。16 GB に制限して文脈 128K のときは、q4_0 でエキスパートに使える VRAM が 4.71 → 7.05 GB になり、32K のプロンプトが 746 → 1,654 tok/s、生成が 26.3 → 34.9 tok/s。 入るなら `int8`、VRAM が一番きついときは `q4_0`。Qwen3.8 の古い経路には PR #21 からあり、GLM-5.3 は `int8`（latent キャッシュ）だけ、qwen4exp の fast path は fp16 のままです |
 | `STRATA_GLM_CPU_LANE` | 物理コアごとに 1 スレッド（NVIDIA の内蔵 GPU、DGX Spark では無効） | RAM 層のエキスパートを計算する CPU スレッド数。`0` で無効 |
 | `STRATA_GLM_CPU_EXACT` | `1`（x86 の CPU で Qwen3.8）、`0`（ほかのモデル。RTX 5090 で GLM-5.3 の生成が 14%、V4.1 が 5% 遅くなったため） | CPU レーンのエキスパートを、GPU のカーネルと同じ計算（GPU と同じ 8 ビットの活性、同じ整数の和）で求めます。どちらで計算しても同じ値になります。`0` で従来の ggml-cpu の計算。ARM の CPU は従来の計算のまま |
 | `STRATA_GLM_LANE_XC` | `1`（x86 の CUDA で Qwen3.8）、`0`（ほかのモデル、HIP、ARM） | `STRATA_GLM_CPU_EXACT` と合わせて、CPU レーンのエキスパートが GPU とビット単位で同じ値になり（GPU と同じ足し算の順と、SiLU の exp）、層のエキスパートの和を固定小数点で取ります（重みを掛けた各エキスパートの行を 2^-34 単位の 64 ビット整数にして足し、最後に 1 回だけ float に丸める。どの順に足しても同じビットで、float の足し算と同じかそれ以上に正確）。どのエキスパートを CPU が計算したかで和が変わりません。prompt の CPU の分担もこれに合わせます（`STRATA_GLM_PREFILL_XROWS`）。これで `STRATA_DETERMINISTIC` なしでも、温度 0 の答えが毎回同じになります（Qwen3.8 で 1 チャンク約 2,000 トークンまでの prompt。それより長いチャンクは、出力の窓が埋まるたびに、エキスパートを走らせた順に足します）。`0` で従来の動き（CPU の分を別に足して最後に加え、prompt の分担は時間で決める）。エキスパートの先送り（`STRATA_GLM_DEFER`）と EXL3 のエキスパートでは使いません。ほかのモデル（GLM、Ornith、DeepSeek V4）は `1` で使えます（まだ測っていません） |
+| `STRATA_Q4X_VERIFY_EXACT` | `1`（CUDA）、`0`（HIP） | Qwen3.8 の下書き（MTP、DFlash 2）あり: 検証窓の dense の GEMV を列ごとにトークン経路と同じ和にして、温度 0 の答えが下書きなしと同じになります（v1.3.125）。HIP では 1 列ずつの GEMV になり、dense の重みと出力ヘッドを列の数だけ読むため、AI PRO R9700 + MTP で 87 -> 67 tok/s に落ちました（#42）。そのため HIP は重みを 1 回だけ読む GEMV のままです（v1.3.125 より前と同じ。下書きありの答えが、長い答えの後半で下書きなしと分かれることがあります）。`1` / `0` でどちらかに固定。`STRATA_DETERMINISTIC` は `1` にします |
 | `STRATA_GLM_CPU_CAL_RETRY` | 3 | 起動時の CPU レーンの計測が乱れていそうなとき（CPU の 4 分の 1 以上でほかの仕事が動いている、または一番遅い回が中央値の 3 倍を超える）、1 秒おきに最大この回数まで測り直し、一番小さい値を使います。それでも CPU が混んでいればログに出します。`0`: 1 回だけ |
 | `STRATA_GLM_TAIL_ON_TOP` | 1 | VRAM に全エキスパート・予備・プロンプト処理が借りる分がすべて入るとき、借りる分をエキスパートの置き場とは別に確保し、プロンプトでエキスパートを追い出さないようにします。v1.3.119 から共有メモリ（DGX Spark）でも、メモリに余裕があればそうします（Qwen3.8 ISTA IQ3_XXS：32K のプロンプトのあとのデコードで SSD からエキスパートを読み直さなくなった）。`0`：借りる分をエキスパートの置き場から削ります（v1.3.104 より前の動き。共有メモリでは v1.3.119 より前の動き） |
 | `STRATA_GLM_X3_SPLIT` | オフ | EXL3 の pack で、各ルートの RAM 層エキスパートのうちこの割合を CPU スレッドが、残りを iGPU が同時に計算する（`auto`: 起動時の計測から）。Ryzen AI Max+ 395 では電力と熱を共有するため遅くなる（[EXL3](exl3/README.md#settings)） |
@@ -843,7 +856,8 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_HTTP_BACKLOG` | 256 | （サーバー）listen のバックログ（accept 待ちのリクエスト数） |
 | `STRATA_MAX_BODY_MIB` | 256 | （サーバー）リクエスト本文の上限。超えると読まずに 413 |
 | `GPU_MAX_HW_QUEUES` | 2（HIP） | ROCm がデバイスごとに作る HW キューの数。シェルにも設定ファイルにもないとき、サーバーが 2 を渡す（v1.3.40）。AI PRO R9700 の DeepSeek V4 の 8K / 16K の prompt は、1 で 586〜650 / 676〜684 tok/s（R9700 向けの手順でアイドル電力の回避策として広まっている値。この PC ではどちらでもアイドル 12 W）、ROCm の既定の 4 で 653〜737 / 748〜756、2 で 866〜995 / 999〜1,011 |
-| `STRATA_GLM_IGPU` | 自動 | iGPU レーン。`libabyss_igpu.so` と HIP のデバイスがあり、CPU より速ければ使う。`0` で使わない、`1` で遅くても使う。`STRATA_GLM_IGPU_LIB=<パス>` で別のライブラリ |
+| `STRATA_GLM_IGPU` | 自動 | iGPU レーン。`libabyss_igpu.so` と HIP のデバイスがあり、CPU よりはっきり速ければ使う（`STRATA_GLM_IGPU_MARGIN`）。`0` で使わない、`1` で遅くても使う。`STRATA_GLM_IGPU_LIB=<パス>` で別のライブラリ |
+| `STRATA_GLM_IGPU_MARGIN` | 1.5 | 自動のとき、起動時の計測でエキスパート 1 個の時間が CPU のこの倍以上速いときだけ iGPU がレーンを受け持つ（計測には実際のトークンでの iGPU 呼び出しの費用が入らない。Ryzen AI Max+ 395 + RTX 5090 の Qwen3.8 16G64G は 0.022 ms 対 0.019〜0.025 ms のほぼ同着で、iGPU を選んだ回はどれも decode が遅かった: MTP 141 → 132 tok/s、既定 94 → 89。GLM-5.3 / V4 / V4.1 は iGPU が 1.9〜2.7 倍速く、iGPU のまま）。正確な合算（`STRATA_GLM_LANE_XC`、Qwen3.8 の既定）が有効なときは CPU がレーンを持つ（iGPU の和は GPU と同じビットにならず、答えがまたレーンに左右されるため）。`1` = 単純に速い方（以前の選び方） |
 | `STRATA_GLM_IGPU_TIMEOUT_MS` | 20 | これより遅れたレーンの呼び出しは CPU のスレッドが引き継ぐ（0: 待つ） |
 | `STRATA_GLM_IGPU_POKE_MS` | 500 | ルーティングのあと、iGPU を空のカーネルで起こしておく時間（50 µs ごと。v1.3.40 で 20 から変更）。DeepSeek V4.1 はルーティングの間に SSD を 20 ms 以上待つことがあり、その間に寝た iGPU は次の呼び出しに 21〜27 ms かかっていた（AI PRO R9700 + 8060S の最も遅い系列: 遅延 123 回、1 token 80.4 ms → 500 で 3 回、65.6 ms） |
 | `STRATA_GLM_IGPU_COLS` | オン | 検証窓（DSpark / 繰り返しのドラフト）の iGPU レーンのエキスパートを、窓の全列で 1 回のレーン呼び出しにまとめ、同じエキスパートを使う列が何本あっても 1 回だけ読む（v1.3.89。結果は同じビット。RTX 5090 + Radeon 8060S、DeepSeek V4.1 UD-IQ2_XXS + DSpark: レーン 60〜62 → 54〜57 us/エキスパート、decode −3〜5%/トークン、swe-bench 48.6 → 51.0 tok/s）。`ABYSS_IGPU_COLS_UNION=0`: 1 回の呼び出しの中で列ごとのグリッド（読みの共有なし）。`0`: 列ごとにレーンを呼ぶ |
@@ -871,12 +885,16 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_GLM_BG_SPLIT` | Qwen3.8 は 1、他は 0 | CPU の道が RAM 層のエキスパートの一部だけを受け持つときも、背景の入れ替えを動かす（0: 全部を受け持つときだけ。以前のまま）。Qwen3.8 で、VRAM の枠にエキスパートの半分以上が入るときは ratio 1 / margin 2 で入れ替える（RTX 5090、Swift 1.5 IQ2_XS 32 GB: VRAM ヒット 95.0 → 96.2%、176 → 182 tok/s）。枠が少ないときは 2 / 8 のまま |
 | `STRATA_GLM_FETCH_COLS` / `STRATA_GLM_CPU_WAIT_COLS` | Qwen3.8 は 1、他は 0 | 先読みを確かめる窓で、CPU の答えを待つ処理とエキスパートを取ってくる処理を、列ごとではなく 1 回のカーネルで全部の列にする（計算は同じ） |
 | `STRATA_GLM_GRAPH` / `STRATA_GLM_GRAPH_MOE` | CUDA は 1 / 1、HIP は 0 | Qwen3.8 の確かめる窓で、delta-net の層を CUDA graph で流す（0: 1 つずつ起動。`_MOE=0`: MoE の振り分けは graph の外）。出力は同じ。1 トークンの起動回数 453 → 254（RTX 5090: 速さは変わらない。DGX Spark で PDL と合わせて: 43.4 → 47.1 tok/s） |
-| `STRATA_GLM_PDL` / `STRATA_GLM_PDL_PREFETCH` | 内蔵 GPU（sm_90 以上）は有効、外付けのカードは無効 / 1 | programmatic dependent launch: 前のカーネルが終わりかけたところで次を始める（DGX Spark、Qwen3.8 16G64G: MTP なし 25.0 → 30.7 tok/s、MTP あり 43.4 → 46.5）。`_PREFETCH`: GEMV が重みの行を早めに L2 へ読む（0: 読まない。2: PDL なしでも読む） |
+| `STRATA_GLM_PDL` / `STRATA_GLM_PDL_PREFETCH` | 内蔵 GPU（sm_90 以上）と、外付けの sm_120 以上のカード（RTX 50）の Qwen3.8 は有効（v1.3.132）。ほかの外付けのカードとモデルは無効 / 1 | programmatic dependent launch: 前のカーネルが終わりかけたところで次を始める（DGX Spark、Qwen3.8 16G64G: MTP なし 25.0 → 30.7 tok/s、MTP あり 43.4 → 46.5。RTX 5090、Qwen3.8 UD 3.1、4K + 512: MTP なし 128.0 → 137.8、MTP あり 178.6 → 184.7。GLM-5.3 / V4 / V4.1 は RTX 5090 で速くならなかったので無効のまま）。`_PREFETCH`: GEMV が重みの行を早めに L2 へ読む（0: 読まない。2: PDL なしでも読む） |
 | `STRATA_GLM_UMA` / `STRATA_GLM_UMA_HEADROOM_GB` | 1 / 8（CUDA） | 内蔵 GPU（DGX Spark）は共有メモリから層の大きさを決め、`_HEADROOM_GB` を空けておく（0: 外付けのカードと同じ決め方。比べる用） |
 | `STRATA_GLM_UMA_SHARE` / `STRATA_GLM_UMA_OTHERS_GB` | 0 / 16 | 内蔵 GPU で、ほかのプロセスが共有メモリを `_OTHERS_GB` より多く使っていて、そのせいでエキスパートが入りきらないときは、読み込みの段階で止まり、メモリを多く使っているプロセスの名前を出す（エンジンを 2 つ動かしたままにして、DGX Spark のメモリが尽きたため）。`STRATA_GLM_UMA_SHARE=1` で、止めずに動かす。ほかに何も動いていないときに、機械より大きいモデルを動かす場合は止めない |
 | `STRATA_GLM_UMA_DIRECT` | 0 | 内蔵 GPU で、RAM 層のエキスパートを VRAM の枠に写さず、その場で読む。既定は無効: 入れ替えが止まり、ヒット率が低いままになる（DGX Spark、Qwen3.8 16G64G 32 GB: 写す方式 45.8、その場で読む方式 34.9 tok/s） |
 | `STRATA_GLM_DISK_BUFFERED` | 0 | （試験用）SSD からのエキスパートの読み込みを、O_DIRECT ではなくページキャッシュ経由にする |
-| `STRATA_GLM_BG_PACE_KB` | 1024 | tier の入れ替えのコピー（prompt の後の補充、入れ替え）を、token の境目でまとめて出さず、MoE 層ごとに最大この KB ずつ、次の層の mixer の間に流す（v1.3.28）。まとめて出すと、次の token の host-mapped の読みがコピーの終わりまで待たされていた（8K prompt の後、約 10 token が 35〜39 ms）。`0`: 従来どおり境目で |
+| `STRATA_GLM_BG_PACE_KB` | 1024。CUDA の Qwen3.8 は 512 | tier の入れ替えのコピー（prompt の後の補充、入れ替え）を、token の境目でまとめて出さず、MoE 層ごとに最大この KB ずつ、次の層の mixer の間に流す（v1.3.28）。まとめて出すと、次の token の host-mapped の読みがコピーの終わりまで待たされていた（8K prompt の後、約 10 token が 35〜39 ms）。CUDA の Qwen3.8（エキスパート約 2 MB）は v1.3.132 から 512：1 MiB ずつでも次の層のルートの書き込みが待たされていた（RTX 5090、UD-IQ3_XXS: 110 → 118 tok/s）。GLM-5.3 / V4 / V4.1（エキスパート 7〜8 MB）は 1024 のまま（512 は速くならず、減衰カウントの効果を消した）。`0`: 従来どおり境目で |
+| `STRATA_GLM_BG_DECAY` / `STRATA_GLM_BG_DECAY_N` / `STRATA_GLM_BG_DECAY_MARGIN` | Qwen3.8、GLM-5.3、DeepSeek V4 / V4.1 の CUDA は 0.995 / 8 / 2（HIP は Qwen3.8 だけ）。ほかは 0 | バックグラウンドの tier の入れ替え（v1.3.132）で、エキスパートの順位を、半分にしていく整数のカウントではなく、token の境目ごとにこの割合で減っていくルートのカウント（約 200 token 分の記憶）で決めます。RAM 層のエキスパートのカウントが、その層で VRAM にいる一番冷たいものを `_MARGIN` 上回ったら入れ替え、1 回の境目で最大 `_N` 個。重みを動かすだけなので答えは同じです（決定論モードの md5 は変わりません）。RTX 5090、4K + 512、iGPU なし：Qwen3.8 UD 3.1 UD-IQ3_XXS 128.5 -> 136.1 tok/s（MTP 185.5 -> 196.6）、DeepSeek V4 0731 UD-Q2_K_XL 53.7 -> 58.2、GLM-5.3 Maya-S-v2 IQ2_XXS 43.8 -> 46.0、V4.1 Compact JA256 47.3 -> 49.0。`0`：以前のカウントと `STRATA_GLM_PROMOTE_RATIO` / `_MARGIN` |
+| `STRATA_GLM_BG_LANE` | GLM-5.3、DeepSeek V4 / V4.1 の CUDA は `512:128:1`。ほかは off | `<レーンのエキスパート 1 個あたり KiB>:<引く KiB>[:<種類>[:<最大 KiB>]]`。CPU レーンが route の RAM 層のエキスパートを ne 個受け持つとき、サービススレッドが待ちのある tier のコピー（種類 1 = 昇格、2 = 降格、3 = 両方）を ne × KiB − 引く KiB だけ、2 本目の copy stream ですぐ流す。CPU が計算している間、リンクは空いていた（V4 0731 の nsys：1 層あたり約 215 µs、96% 空き）ので、その間に渡り、GPU が答えを読む前に終わる。重みを動かすだけで答えは変わらない（決定論 md5、移動ありの厳密レーンの md5 とも同じ）。RTX 5090 + Gen4 x4、4K + 512、iGPU なし：V4 0731 UD-Q2_K_XL 58.3 → 60.7 tok/s、GLM-5.3 Maya-S-v2 IQ2_XXS 46.8 → 49.1、V4.1 Compact JA256 50.0 → 52.2（5 組の計測で +4〜8%）。Qwen3.8 には使わない（レーンの 1 個が約 30 µs で空きが無く −7.5%）。`0`：off |
+| `STRATA_Q4X_GRAPH_PDL` | 外付けの CUDA カードは有効。内蔵 GPU と HIP は無効 | Qwen3.8 の検証窓の層ごとの graph（`STRATA_GLM_GRAPH`）を、PDL が有効なとき PDL の辺つきで capture します（ドライバが断ったら辺なしで取り直し）。RTX 5090 + MTP：同じ token、同じ速さ（190.1 / 190.0 tok/s）。`0`：辺なし（v1.3.132 より前と同じ） |
+| `STRATA_Q4X_GDN_MID` / `STRATA_Q4X_GDN_MID_PF` | 1 / 0（CUDA の sm_90 以上。HIP は使いません） | Qwen3.8 のデコード：delta-net の層の alpha / beta、conv + SiLU、再帰を、qkv / z の GEMV の後の 1 回の起動で計算します。同じ計算を同じ順で行うので、同じビットです（`gdn_core_parity`）。`_PF=1`：再帰の間に `ssm_out` の重みを L2 へ読みます（既定は無効。UD 3.1 で無効 122.7 tok/s、有効 120.5。状態の読み出しとぶつかります）。`STRATA_Q4X_GDN_MID=0`：別々の起動 |
 | `STRATA_GLM_ZERO_COPY` | オン | copy engine を使わない token の境目（v1.3.21）: 表の更新・埋め込み行（`token_embd` の pinned コピー、Q8_0 / Q5_K）・トークンを、カーネルが host-mapped で直接読み書きする。`0`: 従来どおり memcpy |
 | `STRATA_GLM_GAP_PROF` | オフ | `1`: 答えごとに `glm gap prof` の行を出す。トークンとトークンの間の時間の内訳（host 側のラップと、timing event で測った GPU の空き） |
 | `STRATA_GLM_TAIL_SKIP` / `_W` | オフ | ルートの r 位より下（または確率の割合が閾値より下）で VRAM にないエキスパートを計算しない。CPU レーンが遅い環境で速くなるが、答えが変わる（KL 0.01〜0.02 程度） |
@@ -894,6 +912,7 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_GLM_CPU_1T` | オン | CPU レーンの 1 トークン用の行を軽くする（ggml の内積とビット一致）。VNNI と VBMI のある AVX-512 の CPU（Zen 4 / Ice Lake 以降）では、IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS の格子をレジスタの中で引く（v1.3.41。Ryzen AI Max+ 395 の 16 スレッドで DeepSeek V4 のエキスパート 1 個が 109 → 90 µs、内蔵 GPU なしの生成が +3〜9%。`STRATA_NO_IQ512_VBMI=1` でこれだけ無効）。それ以外の CPU では AVX2 の IQ3_S / IQ3_XXS。`0` で無効 |
 | `STRATA_GLM_VRAM_EVICT` | 使用回数 | `lru`: VRAM 層の入れ替えで、最も長く使われていない expert を追い出す（キャッシュの調査用） |
 | `STRATA_GLM_DISK_READERS` | オフ | prompt 処理で SSD 上の expert をこの数のスレッドで読む（DRAM なしの NVMe 向け。環境ごとに測ること。DeepSeek V4.1 は `8` で 1K トークンの prompt が 33 → 27 秒） |
+| `STRATA_GLM_DISK_PAR` | オフ | `1`: 答えている最中、トークンが VRAM と RAM で見つけられなかったエキスパートを、専用のスレッドで SSD から読む。スレッドはエキスパート 1 個の片の数だけ（3 部 × `STRATA_GLM_READ_CHUNKS`（8）＝ 24。呼び出したスレッドを含む）で、1 個の片を全部同時に読む（今は 9 スレッドで約 3 巡）。`<n>`（2〜64）でスレッド数を指定。変わるのは読む順だけで、答えは同じ。スレッドは読みの中で待ち、読みと読みの間は `STRATA_GLM_DISK_PAR_SPIN_US`（50）µs 回ってから眠る。`STRATA_GLM_TIMING=1` のとき、オンでもオフでもディスク読みの統計（待っている間の速さ、エキスパート 1 個の待ちの平均 / p50 / p90 / p99）を出すので、比べるのに使える。まだ測っていない（fio、6.7 GB/s の NVMe：424 KB の読みを 9 本同時で 4.64 GB/s、24 本同時で 5.10 GB/s） |
 | `STRATA_GLM_MIRROR` | オフ | `<フォルダ>[:<フォルダ>...]`: 別の SSD に置いたモデルのシャードの写し（同じ名前）。エキスパートを読むたびに、早く終わりそうな方の SSD から読む（答えている最中と起動時の読み込みの両方）。DeepSeek V4.1 UD-IQ2_XXS、AI PRO R9700、2 枚目は USB4: SSD 待ち −20%、32 GB + 64 GB で +21%（v1.3.77、[SSD2](SSD2.ja.md)）。Linux のみ |
 | `STRATA_GLM_DISK_LANE` | オフ | `1`: SSD から RAM に読んだエキスパートを、VRAM に送らずその場で CPU / iGPU レーンが計算する（v1.3.29。V4.1 の Q2_K/Q3_K エキスパートで −5%、小さい Q2 では効果なし） |
 | `STRATA_DS41_ENGRAM_CACHE_MB` / `_THREADS` | 256 / 15 | DeepSeek V4.1: Engram の行キャッシュと、行を読むスレッド数（v1.3.29） |
@@ -915,7 +934,7 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_GLM_ROUTE_COLS` | オン（Qwen3.8） | 検算の窓で、列ごとのルーティングを 1 回の起動でまとめて行う（v1.3.119。同じ計画を同じ順番で作る。列ごとに起動すると窓 1 つで 48 × T 回、DGX Spark で 1 回 ~13 us かかっていた）。`1`：ほかのモデルでも使う、`0`：列ごとに起動 |
 | `STRATA_GLM_MVN_PDL` | オン | 検算の窓の密な GEMV（`mvn`）を PDL（programmatic dependent launch）で起動し、前の起動を待つ前に重みの行を L2 へ先読みする（1 トークンずつの GEMV と同じやり方。v1.3.119、CUDA。和は同じ）。`0`：前の起動のしかた |
 | `STRATA_Q35_MTP_Q4` | オフ | `1`（試し）：Qwen3.8 の MTP の下書きが、Q8_0 の射影（IQ4_NL）と head（Q4_K）の 4 bit のコピーを読む（読み込み時に作る）。下書きは速くなるが、採用は減る（DGX Spark：87.6% → ~80%）。どのトークンも検算の窓が決めるので答えはモデルのものだが、使わないときとトークンが変わることがある（v1.3.119） |
-| `STRATA_DETERMINISTIC` | オフ | `1`（確かめ用、遅くなる）: 時計の時間で決まる選択を止める。prompt の CPU / iGPU の分担、生成の CPU / iGPU レーン、裏でのエキスパートの移動と先読み、n-gram の判定、pack の `expert_usage.txt`。また、prompt のエキスパートの足し算を、プールの中身によらず同じ順にする（`STRATA_MMQ_WHOLE_K=1`、`STRATA_GLM_PREFILL_WINDOW=0`）。同じリクエストを 2 回走らせると同じトークンになる（出力を変えないはずの変更の A/B 用）。環境変数ですでに指定したものはそのまま |
+| `STRATA_DETERMINISTIC` | オフ | `1`（確かめ用、遅くなる）: 時計の時間で決まる選択を止める。prompt の CPU / iGPU の分担、生成の CPU / iGPU レーン、裏でのエキスパートの移動と先読み、n-gram の判定、pack の `expert_usage.txt`。また、prompt のエキスパートの足し算を、プールの中身によらず同じ順にする（`STRATA_MMQ_WHOLE_K=1`、`STRATA_GLM_PREFILL_WINDOW=0`）。同じリクエストを 2 回走らせると同じトークンになる（出力を変えないはずの変更の A/B 用）。環境変数ですでに指定したものはそのまま。**確かめ用のスイッチで、ふだん使う設定ではありません:** エキスパートの置き場所（VRAM / RAM の層）を起動時のまま固定するので、そこにないエキスパートはトークンごとに毎回読み直します。PCIe が詰まりやすいカードでは大きく遅くなり、RTX 4090 + 96 GB で Qwen3.8 UD-Q4_K_XL は 54.1 から 14.6 tok/s（3.7 倍遅い）、RAM からの読み込みは 1 トークンあたり約 20 から 214 回に増えました（#39）。ふだんの使い方で毎回同じ答えにしたいときは、Qwen3.8 ではレーンの厳密な合算（`STRATA_GLM_LANE_XC`、v1.3.127/v1.3.128 から既定でオン）が速度を落とさずに使えます |
 | `STRATA_DS4_SPEC_PIPE` | auto（HIP）、1（NVIDIA） | 検証の窓: `1` pipelined（v1.3.43 から列を 2 つのグループに分けて 2 本の HW キューに流し、グループの中はまとめて計算）、`0` batched（dense の重みを窓で 1 回だけ読む）、`auto`: 窓の幅ごとに、最初の窓で両方を 3 回ずつ測り、速いほうをその幅で使い続ける（v1.3.40。幅ごとは v1.3.43 から。HIP の既定。NVIDIA ではまだ確認していない）。RTX 5090 + iGPU では pipelined（swe-bench 90 対 73 tok/s）、AI PRO R9700（HW キュー 2 本、v1.3.43）ではどの幅も pipelined（2 / 4 / 6 / 8 列で 34〜36 / 52〜56 / 71 / 88 ms、batched は 41 / 68.5 / 98 / 133） |
 | `STRATA_DS4_SPEC_GROUP` | 窓の半分 | pipelined の窓の 1 グループの列数（v1.3.43）。既定は ceil(T / 2) 列ずつの 2 グループ |
 | `STRATA_DS4_WIN_COLS` | オン | 窓のグループで、VRAM にある expert の gate/up と down を列ごとではなく全列まとめて 1 回ずつ起動する（v1.3.43。ビット一致: `STRATA_DS4_WIN_COLS_CHECK=1` で 16 グループに 1 回、列ごとの起動と照合）。`0`: 列ごと |

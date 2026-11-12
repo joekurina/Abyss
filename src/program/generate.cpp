@@ -237,6 +237,9 @@ struct Options {
     /// Plan v0.3 P4: `--expert-cache auto` sizes the VRAM tier from what is free after the weights, the session
     /// and the KV state, minus this reserve for the graphs, the hit scratch and the head.
     int vram_reserve_mib = 700;
+    /// --vram-reserve-mib given on the command line: it also sets STRATA_GLM_RESERVE_MB, the reserve the GLM runner's
+    /// expert pool (GLM-5.3, Qwen3.8, DeepSeek V4/V4.1 packs) keeps free - one knob on every path (issue #39)
+    bool vram_reserve_given = false;
     /// Plan v0.3 P5: batched prompt processing in chunks of this many tokens (0 = the token path).
     int64_t prefill_chunk = 0;
     /// `--prefill auto`: the largest chunk (up to 8192) whose buffers the expert cache can lend.  Every expert a chunk
@@ -454,6 +457,8 @@ void usage() {
                  "                       GPU via `moe_hit_grouped_s2`.  DEFAULT 0.  Measured at 4096 slots\n"
                  "                       with --expert-cache-per-layer: 54.4%% hits, CPU pool drain 19.1 -> 10.3\n"
                  "                       ms/token, -2.7 ms/token end to end.\n"
+                 "  --vram-reserve-mib N VRAM kept free beside the expert cache/pool, MiB (every model; sets\n"
+                 "                       STRATA_GLM_RESERVE_MB for --glm-pack, and wins over it if both are set)\n"
                  "  --expert-cache-device1 N  pre-fill N experts on CUDA1 (experimental)\n"
                  "  --expert-cache-device2 N  pre-fill N more experts on CUDA2\n"
                  "  --expert-cache-device3 N  pre-fill N more experts on CUDA3\n"
@@ -1402,7 +1407,8 @@ static int glm_pack_generate(const Options& o) {
         // (2026-11-10) and the prompt path's sums in one order whatever the pool holds: MMQ a tile a block over the
         // whole K (no stream-k split, which follows the launch's tile count) and every routed row in one output window
         // (the window's flushes follow which experts are resident: a token's experts added in another order)
-        static const char* const kOn[][2] = {{"STRATA_MMQ_WHOLE_K", "1"}, {"STRATA_GLM_PREFILL_WINDOW", "0"}};
+        static const char* const kOn[][2] = {{"STRATA_MMQ_WHOLE_K", "1"}, {"STRATA_GLM_PREFILL_WINDOW", "0"},
+                                             {"STRATA_Q4X_VERIFY_EXACT", "1"}};   // (Qwen3.8's verify GEMVs, #42)
         std::string kept;
         for (const char* k : kOff) {
             if (std::getenv(k) == nullptr) set_env(k, "0");
@@ -3365,7 +3371,10 @@ int main(int argc, char** argv) {
         else if (a == "--expert-cache-device3") o.expert_cache_remote[2] = std::atoi(next("--expert-cache-device3"));
         else if (a == "--expert-cache-remote-placement")
             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
-        else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
+        else if (a == "--vram-reserve-mib") {
+            o.vram_reserve_mib = std::max(0, std::atoi(next("--vram-reserve-mib")));
+            o.vram_reserve_given = true;
+        }
         else goto args_part2;   // (two chains: one else-if chain this long passes MSVC's nesting limit, C1061)
         continue;
     args_part2:
@@ -3482,6 +3491,16 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    // --vram-reserve-mib feeds the GLM runner's pool too (issue #39: on a Qwen3.8 pack the flag was parsed and
+    // ignored - that pool read STRATA_GLM_RESERVE_MB only).  The flag wins over the variable: it is the config's own
+    // arg, while setup writes the variable as a per-machine default (HIP, Windows APUs)
+    if (o.vram_reserve_given) {
+        const std::string mb = std::to_string(o.vram_reserve_mib);
+        const char* env_mb = std::getenv("STRATA_GLM_RESERVE_MB");
+        if (env_mb != nullptr && mb != env_mb)
+            std::fprintf(stderr, "NOTE: --vram-reserve-mib %s overrides STRATA_GLM_RESERVE_MB=%s\n", mb.c_str(), env_mb);
+        set_env("STRATA_GLM_RESERVE_MB", mb.c_str());
+    }
     // ---- the glm5-next pack path (M3.1): BEFORE every qwen4exp-shaped check below (this driver's
     // session/graph machinery is qwen4exp's; a GLM pack runs the verified Glm5Model runner instead,
     // see glm_pack_generate).  --glm-pack with an explicit non-default --pack is almost certainly a
@@ -3489,6 +3508,17 @@ int main(int argc, char** argv) {
     if (!o.glm_pack.empty()) {
         // --kv int8 on the GLM path: the INT8 latent cache (Glm5Model::lat_q8_, read at load)
         if (o.kv == "int8" && std::getenv("STRATA_GLM_KV_INT8") == nullptr) set_env("STRATA_GLM_KV_INT8", "1");
+        // --kv q4_0 / int8 / k8v4 on the qwen35moe path (Ornith): the attention layers' cache format (qwen35_fast.hpp)
+        if (std::getenv("STRATA_GLM_KV_Q35") == nullptr) {
+            const std::string kv = o.kv == "q4" ? "q4_0" : o.kv;
+            if (kv == "q4_0") set_env("STRATA_GLM_KV_Q35", "1");
+            else if (kv == "int8") set_env("STRATA_GLM_KV_Q35", "2");
+            else if (kv == "k8v4") set_env("STRATA_GLM_KV_Q35", "3");
+            else if (kv != "fp16") {
+                std::fprintf(stderr, "maya generate: --kv must be fp16, int8, q4_0 or k8v4\n");
+                return 2;
+            }
+        }
         if (o.pack != "pack/full") {
             std::fprintf(stderr, "maya generate: note: --glm-pack supersedes --pack (%s ignored)\n", o.pack.c_str());
         }

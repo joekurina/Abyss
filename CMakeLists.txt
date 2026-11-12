@@ -134,6 +134,8 @@ target_compile_options(strata_warnings INTERFACE
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wall>
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wextra>
   $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/W4>
+  # CUDA 13's CCCL (pulled in by <cooperative_groups.h>) stops with #error under MSVC's traditional preprocessor.
+  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/Zc:preprocessor>
   $<$<COMPILE_LANGUAGE:HIP>:-Wall>
   $<$<COMPILE_LANGUAGE:HIP>:-Wextra>)
 if(STRATA_WERROR)
@@ -322,6 +324,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(hc4_fused_parity src/kernels/hc4_fused_parity.cpp)
     target_include_directories(hc4_fused_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(hc4_fused_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    # the route's 8-warp top-k against warp 0's: the same ids (GPU, synthetic)
+    add_executable(topk_parity src/kernels/topk_parity.cpp)
+    target_include_directories(topk_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(topk_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     # the delta-net middle in one launch (q35::gdn_core) vs the launches it replaces: the same bytes
     add_executable(gdn_core_parity src/kernels/gdn_core_parity.cpp)
     target_include_directories(gdn_core_parity PRIVATE ${_strata_gpu_include_directories})
@@ -331,6 +337,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(qsa_rows_parity src/kernels/qsa_rows_parity.cpp)
     target_include_directories(qsa_rows_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(qsa_rows_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    # the QSA block top-k's digit search by 256 threads vs thread 0's walk and the reference kernel: the same ids
+    add_executable(qsa_topk_parity src/kernels/qsa_topk_parity.cpp)
+    target_include_directories(qsa_topk_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(qsa_topk_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   endif()
   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/ggml)
   target_include_directories(strata_kernels PRIVATE third_party/ggml)

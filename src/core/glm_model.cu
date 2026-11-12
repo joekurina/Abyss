@@ -18,9 +18,11 @@
 // is what glm_model_test's batched-vs-streamed equivalence pins.
 #include "glm_fast_state.hpp"
 #include "shard_io.hpp"
+#include "strata/core/knobs.hpp"
 
 #include "strata/kernels/glm_dsa.hpp"
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/glm_ffn.hpp"
 #include "strata/kernels/glm_hc.hpp"
 #include "strata/kernels/glm_kda.hpp"
@@ -1630,8 +1632,10 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     // layer's BF16 K / V caches at the context, and qwen4exp's QSA block keys (one pooled key per 4 cells)
     const double gdn_state = 4.0 * ((double) g.ssm_state * g.ssm_v_heads * g.ssm_state +
                                     (double) g.ssm_conv_dim() * (g.d_conv - 1));
+    const int q35_kv = g.q4x || getenv("STRATA_GLM_KV_Q35") == nullptr ? 0 : std::max(0, std::min(3, std::atoi(getenv("STRATA_GLM_KV_Q35"))));
     const double q35_attn_state =
-        2.0 * 2.0 * (double) max_ctx * g.attn_head_kv * g.head_dim +
+        (double) max_ctx * g.attn_head_kv *
+            (q35_kv != 0 ? (double) (strata::kernels::q35::kv_row_bytes(q35_kv, false) + strata::kernels::q35::kv_row_bytes(q35_kv, true)) : 4.0 * g.head_dim) +
         (g.q4x ? 4.0 * 128.0 * ((double) max_ctx / 4.0 + 2.0 + 3.0) : 0.0);
     const auto layer_state = [&](int l) {
         if (g.qwen35()) return g.is_recr(l) ? gdn_state : q35_attn_state;
@@ -1885,7 +1889,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             }
         }
         const double room =
-            c.free > used ? (double) Glm5Model::pool_avail((size_t) (c.free - used), (size_t) c.total) : 0.0;
+            c.free > used ? (double) Glm5Model::pool_avail((size_t) (c.free - used), (size_t) c.total, g.q4x) : 0.0;
         Eval ev;
         ev.per = bsum > 0 ? std::min<int64_t>(g.n_expert, (int64_t) (room / bsum)) : 0;
         while (ev.per > 0 && (double) ev.per * ssum > room) --ev.per;
@@ -3651,7 +3655,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         for (size_t c = 0; c < c_weight.size(); ++c) weight_sum += (double) c_weight[c] * (double) c_stride[c];
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        const size_t reserve = (size_t) 1536 << 20;   // context growth + the driver's share
+        // context growth + the driver's share; STRATA_GLM_RESERVE_MB (--vram-reserve-mib) as on the fast path
+        const size_t reserve = (size_t) strata::core::env_num("STRATA_GLM_RESERVE_MB", 1536.0, 0.0, 1048576.0) << 20;
         const size_t pool_avail = free_b > reserve ? free_b - reserve : 0;
         // STRATA_GLM_POOL_SLOTS0=n caps the pool at n largest-class-equivalent slots (debug/tuning)
         size_t pool_bytes_cap = pool_avail;

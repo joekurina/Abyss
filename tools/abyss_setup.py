@@ -45,6 +45,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+WIN = os.name == "nt"
 sys.path.insert(0, str(ROOT))
 import setup as S  # noqa: E402
 
@@ -222,10 +223,17 @@ def nvcc_major(nvcc: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def venv_bin(name: str, windows: bool | None = None) -> Path:
+    """A program in Abyss's .venv: .venv/Scripts/<name>.exe on Windows (setup-deepseek.bat makes it there),
+    .venv/bin/<name> elsewhere (issue #39: the Linux layout was hard-wired)."""
+    win = WIN if windows is None else windows
+    return ROOT / ".venv" / ("Scripts" if win else "bin") / (name + (".exe" if win else ""))
+
+
 def build_engine(arch: str | None, gpus, nvcc_arg: str | None = None) -> Path:
     exe = ROOT / "build" / "strata"
-    cmake = ROOT / ".venv" / "bin" / "cmake"
-    ninja = ROOT / ".venv" / "bin" / "ninja"
+    cmake = venv_bin("cmake")
+    ninja = venv_bin("ninja")
     cc = cuda_archs(arch, gpus)
     nvcc = nvcc_arg or shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
     conf = [cmake, "-S", ROOT, "-B", ROOT / "build", "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}",
@@ -326,7 +334,7 @@ def write_config(name: str, pack: Path, ctx: int, port: int, rewrite: bool, gpus
             **(extra or {}),
         }, indent=1) + "\n", encoding="utf-8")
         S.ok(f"{cfg.name} written (context {ctx}, port {port})")
-    py = ROOT / ".venv" / "bin" / "python"
+    py = venv_bin("python")
     run.write_text("#!/bin/sh\n"
                    f"# {model['title']} ({name}) on Abyss: the dashboard and API (written by setup-deepseek.sh)\n"
                    f'cd "{ROOT}" || exit 1\n'
@@ -454,7 +462,7 @@ def main() -> int:
                     "ornith: Ornith-1.5-122B, qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
                     "qwen38: Qwen3.8-Flash-Next, glm: GLM-5.3-Flash (zephel01's GGUFs, --quant picks the PC size)")
     ap.add_argument("--quant", help="v4: a folder of " + REPO + " (default UD-Q2_K_XL, the tested one), or zephel01's 16G64G / 32G64G / 32G96G; v41: 132G "
-                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B (default) or 24G64G; qwen38: 12G32G, 16G64G (default) or 24G64G; glm: 32G96G (default) or 32G128G")
+                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B (default), 24G64G or 32G128G (Ornith-1.5-397B); qwen38: 12G32G, 16G64G (default) or 24G64G; glm: 32G96G (default) or 32G128G")
     ap.add_argument("--name", help="the model's name in abyss-<name>.json / run-abyss-<name>.sh (default dsv4-<quant>, "
                                    "dsv41-<quant>)")
     ap.add_argument("--data-dir", default=str(ROOT.parent / "Abyss-data"), help="where the models go (default: Abyss-data beside Abyss)")

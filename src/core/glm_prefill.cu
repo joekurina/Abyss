@@ -899,7 +899,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
     // (unified memory: fast_setup prices the pool from MemAvailable - CUDA's free leaves out the page cache, which a
     // GB10's cudaMalloc reclaims; the same figure here)
     if (F->unified_memory) dev_free = std::max(dev_free, glmfast::uma_room_now());
-    size_t avail = pool_avail(dev_free, dev_total);
+    size_t avail = pool_avail(dev_free, dev_total, g_.q4x);
     // (unified memory with STRATA_GLM_VRAM_GB: the cap counts what this process holds, as fast_setup does - the
     // device's total - free counts the page cache and every other process, and left a GB10 at 16 GB no pool here:
     // its prompts then ran token by token, 3.8K tokens in 129 s)
@@ -1430,8 +1430,11 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
     // way would otherwise be lent under it
     F->bg_hold = true;
     F->bg_drain(nullptr, SIZE_MAX);   // the paced promotions' remaining pieces go now
+    if (F->copy2 != nullptr) F->bg_drain(nullptr, SIZE_MAX, 3, F->copy2);   // (those begun there: STRATA_GLM_BG_LANE)
     // Retire metadata as well as DMA. With the hold set, the boundary cannot start replacement moves.
-    if (!glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm lending copies", err) || !fast_boundary(err))
+    if (!glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm lending copies", err) ||
+        (F->copy2 != nullptr && !glmfast::cuda_ok(cudaStreamSynchronize(F->copy2), "glm lending copies", err)) ||
+        !fast_boundary(err))
         return false;
     if (!F->bg.empty() || !F->draining.empty()) {
         err = "glm lending: tier moves were not retired";
@@ -2667,15 +2670,19 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const char* v = getenv("STRATA_GLM_PREFILL_CPU");
         return v == nullptr || std::atoi(v) != 0;
     }();
+    // the CPU lane can compute layer il's experts in a prompt at all (cpu_lane: and its plan may take them)
+    const auto cpu_lane_ok = [&](int il) {
+        return !S->pin_fail && F->cpu_pool && F->cpu_c_ms > 0.0 &&
+               (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].n_ff > 0 &&
+               !F->L[(size_t) il].exl3 &&   // (EXL3: no multi-row CPU kernel yet - its staged experts all go over PCIe)
+               F->L[(size_t) il].nv_host.empty();   // (NVFP4: neither the expert scales yet)
+    };
     const auto cpu_lane = [&](int il) {
         // (no gate on the CPU's speed against the link: the plan below takes an expert only while the host's time
         // stays under the copy stream's, and kappa corrects it as it goes.  The old gate - one copy slower than two
         // CPU experts - was a cliff: issue #24's Gen5 x8 host timed 0.155 ms an expert in some processes and 0.159-0.169
         // in others, and those gave the CPU no prompt work at all, 2,050 vs 2,700 tok/s on 16K prompts)
-        return pf_cpu && !S->pin_fail && F->cpu_pool && F->cpu_c_ms > 0.0 &&
-               (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].n_ff > 0 &&
-               !F->L[(size_t) il].exl3 &&   // (EXL3: no multi-row CPU kernel yet - its staged experts all go over PCIe)
-               F->L[(size_t) il].nv_host.empty();   // (NVFP4: neither the expert scales yet)
+        return pf_cpu && cpu_lane_ok(il);
     };
     // the CPU lane's stream (x down, the rows' tokens down) and its pinned buffers
     // A failed allocation frees what it had and leaves every pointer null and size 0 (it used to keep the new size
@@ -2920,15 +2927,15 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     hgemm_q(Ly.av, KV, E, x16, E, B.v, KV, tn, 0.0f);
                     S->mark("q35_proj", s);
                     q35::attn_prep_rows(B.qf, B.k, B.v, Ly.q_norm, Ly.k_norm, g.norm_eps, g.n_head, g.attn_head_kv, D,
-                                        g.n_rot, g.rope_base, pt0, tn, Ly.kc, Ly.vc, B.q, s);
+                                        g.n_rot, g.rope_base, pt0, tn, Ly.kc, Ly.vc, B.q, s, q35_kv_);
                     if (g.q4x) {
                         Q4xBufs Q = carve_q4x(c, (size_t) tn, g);
                         if (!q4_attn(il, pt0, tn, xs, B.q, B.ao, Q, err)) return false;
                     } else {
                         q35::attn_prompt(B.q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, pt0, tn,
-                                         1.0f / std::sqrt((float) D), B.ao, s);
+                                         1.0f / std::sqrt((float) D), B.ao, s, q35_kv_);
                     }
-                    q35::attn_gate_rows(B.ao, B.qf, tn, g.n_head, D, s);
+                    q35::attn_gate_rows(B.ao, B.qf, tn, g.n_head, D, s, q35_kv_);
                     S->mark("q35_attn", s);
                     if (t0 + tn == T) dump_row("attn_gated-" + Ls, B.ao, HDq, tn - 1);
                     if (!skip_output) {
@@ -3387,7 +3394,16 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             const double fix_ms = ig ? S->fix_ms_ig : 2.0 * F->cpu_c_ms;
             // (the host buffers for the most rows the CPU may take, before it takes any: when they do not allocate,
             // every expert stays on PCIe - the prompt goes on instead of failing)
-            if (cpu_lane(il) && cpu_bufs(moe_window_rows((size_t) T, g))) {
+            // (the exact prompt's light RAM-tier experts go to the CPU even under STRATA_GLM_PREFILL_CPU=0, which
+            // STRATA_DETERMINISTIC sets: that take follows no timing, and through MMQ instead they summed in another
+            // arithmetic than the resident ones beside them - a prompt's numbers then followed what was resident.
+            // Measured: the second request of a deterministic run gave other tokens under two CPU plans, whose tier
+            // moves had left other experts resident)
+            // (and a layer the exact prompt cannot take - a type without exact rows, as UD 3.1's Q2_0 down layers -
+            // in a chunk it would otherwise cover gives the CPU nothing: its timed share made such a short prompt's
+            // numbers follow the run's timings and pool - two runs of the same prompt gave other tokens)
+            const bool x_skip = F->xc && !xact && (size_t) T * (size_t) K <= (size_t) moe_window_rows((size_t) T, g);
+            if ((xact ? cpu_lane_ok(il) : cpu_lane(il) && !x_skip) && cpu_bufs(moe_window_rows((size_t) T, g))) {
                 std::vector<size_t> ram_i;
                 int n_pcie = 0;
                 for (size_t i = 0; i < staged.size(); ++i) {
@@ -4494,7 +4510,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             hgemm_q(Ly.ak, KVq, E, S->x16, E, kq, KVq, Tv, 0.0f);
             hgemm_q(Ly.av, KVq, E, S->x16, E, vq, KVq, Tv, 0.0f);
             q35::attn_kv_rows(kq, vq, Ly.k_norm, g.norm_eps, g.attn_head_kv, g.head_dim, g.n_rot, g.rope_base, p0, Tv,
-                              Ly.kc, Ly.vc, s);
+                              Ly.kc, Ly.vc, s, q35_kv_);
             q35_row_done_ = std::max(q35_row_done_, p0 + Tv - 1);
             S->mark("mtp_rows", s);
         } else if (Tv > 0) {

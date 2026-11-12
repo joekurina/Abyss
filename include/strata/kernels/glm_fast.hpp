@@ -40,6 +40,15 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s);
 /// The per-GPU choices mv() makes (glm_fast.cu's mv_tune) - for abyss_gpu_tune: the current device's Q6_K split (the
 /// table's or STRATA_GLM_MV_Q6K_SPLIT's), and a forced one for the calls that follow (1 / 0; -1 = back to the choice)
 bool mv_q6k_split_choice();
+/// the warps a row mv() (and mvn_mv, a column) gives a call whose jobs of `type` add up to n_out rows: 1, 2 or 4 for
+/// the typed kernels (Q6_K, Q8_0, Q4_K, Q5_K), 0 when that type goes to the generic one-warp kernel (other types, or
+/// STRATA_GLM_MV_GENERIC) - for fused kernels that must sum a row as mv() does
+int mv_split_rule(int type, int n_out);
+/// (test) the route's 8-warp top-k against warp_topk: n blocks of 512 scores (sel_d), E_d[b] of them live, k = 1..16;
+/// *bad_d counts the differing ids
+int route_topk_check(const float* sel_d, const int* E_d, int n, int* bad_d, cudaStream_t s);
+/// (test) cycles of one selection: cyc_d[0] warp_topk, cyc_d[1] block_topk512 (512 scores at sel_d)
+void route_topk_time(const float* sel_d, int E, int k, int reps, unsigned long long* cyc_d, cudaStream_t s);
 void mv_force_q6k_split(int split4);
 void mv_force_split(int split);   // gpu_tune: every typed GEMV launch at 1 / 2 / 4 warps a row (other: the engine's rule)
 /// mv() for nc activation columns at once (1..8 a launch, wider calls in runs) - a verify window's tokens, the DSpark
@@ -473,5 +482,10 @@ void rms_q8(float* h, const float* add, const float* w, float eps, int n, float*
 
 /// argmax over n floats -> *out (device int).  Ties: lowest index.
 void argmax(const float* x, int n, int* out, cudaStream_t s);
+/// argmax's index from 128 blocks (the last one to finish picks): the same index (a total order: the largest value, the
+/// lowest index among equal ones). scratch: argmax_mb_scratch_bytes() of device memory, zeroed once, one stream at a
+/// time; null, a misaligned x or a short n: argmax.
+void argmax_mb(const float* x, int n, int* out, void* scratch, cudaStream_t s);
+size_t argmax_mb_scratch_bytes();
 
 }  // namespace strata::kernels::glmf

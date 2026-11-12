@@ -7,6 +7,199 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.134 - 2026-11-12
+
+Ornith-1.5 (122B / 397B) takes a smaller K/V cache, so a 16 GB card runs Ornith-1.5-397B at a 128K context (#44).
+
+- **`--kv q4_0` / `k8v4` / `int8` on the qwen35moe path (Ornith-1.5).** The 4-bit and 8-bit caches were only on
+  Qwen3.8's older attention path; on Ornith `--kv` was read for GLM-5.3's `int8` alone and `q4_0` / `k8v4` were
+  silently ignored, so its attention layers always kept fp16 K/V - while the pool-shortage error suggested
+  `--kv q4_0`. Now `q4_0` (K and V Hadamard-rotated, then ggml's q4_0: 144 B a row against 512), `k8v4` (int8 K +
+  rotated q4_0 V) and `int8` (272 B) are written by the token, prompt, verify-window and NextN paths and read
+  directly by the split decode kernel, the WMMA prompt kernel and the verify window; the freed VRAM goes to the
+  expert pool, and the split cost model counts the smaller cache. At `--max-context 131072` Ornith-1.5-397B's cache
+  is 4.00 GB in fp16, 2.12 / 1.62 / 1.12 GB in int8 / k8v4 / q4_0: capped at 16 GB (`STRATA_GLM_VRAM_GB=16`, 46 GB
+  RAM tier) fp16 stops with `not enough VRAM for the expert pool ... (81 MB short)` while all three start and answer.
+  Ornith-1.5-122B 24G64G capped at 16 GB with a 128K context: experts get 7.05 GB instead of 4.71 (1,470 slots
+  instead of 980), decode 26.3 -> 34.9 tok/s, a 32K prompt 746 -> 1,654 tok/s. At 32 GB decode is unchanged
+  (4K-64K) and prompts are 5-9% slower at 32K-64K (the WMMA tiles turn the codes back into FP16).
+  KL against fp16 (122B 24G64G, 511 scored tokens): after an 8K English context q4_0 0.019 (same top token 93.9%),
+  k8v4 0.013, int8 0.008; after 32K of code 0.007 / 0.005 / 0.003; after an 8K Japanese context 0.031 (91.6%) /
+  0.021 / 0.014; nll within 0.013 of fp16 everywhere. A wrong `--kv` value with `--glm-pack` now stops with an error
+  instead of being ignored. Default stays fp16 (the same tokens as v1.3.133); Qwen3.8's fast path keeps fp16.
+- `setup --quant` help lists Ornith's `32G128G` (Ornith-1.5-397B).
+- Manual (EN/JA): `--kv` row in Settings and "when VRAM is short" in the Ornith section.
+
+Not run on an AMD card: the HIP build (gfx1201 / gfx1151) compiles and links.
+
+## v1.3.133 - 2026-11-12
+
+GLM-5.3 and DeepSeek V4 / V4.1 decode faster on NVIDIA, the same answers; and v1.3.132 builds on Windows again.
+RTX 5090 (OCuLink Gen4 x4) + Ryzen AI Max+ 395, 123 GB RAM, iGPU off, 4K prompt + 512 tokens, greedy, median of 3
+runs alternating with v1.3.132:
+
+| model | v1.3.132 | v1.3.133 |
+|---|---:|---:|
+| DeepSeek V4 0731 UD-Q2_K_XL | 58.3 tok/s | **60.7** (+4.2%) |
+| GLM-5.3-Flash Maya-S-v2 IQ2_XXS | 46.8 | **49.1** (+5.0%) |
+| DeepSeek V4.1 Compact JA256 (32G96G) | 50.0 | **52.2** (+4.4%) |
+| DeepSeek V4.1 1017 UD-IQ2_XXS (SSD-bound) | 21.4 | 21.6 (+1.1%) |
+| Qwen3.8-Flash-Next 16G64G | 128.0 | 127.0 (unchanged path) |
+
+- **Tier promotions cross the link while the CPU lane computes (GLM-5.3, DeepSeek V4 / V4.1, CUDA).** An nsys trace
+  of V4 0731 showed the PCIe link ~96% idle for the ~215 us a layer between the route and the CPU lane's answer,
+  while the background moves queued after the answer ran into the next layer's route (12 -> 25 us; 2 MiB pieces
+  added ~60 us a layer, which is why more moves had been slower). Now, when the lane takes a route's ne RAM-tier
+  experts, its service thread lets ne x 512 KiB - 128 KiB of the queued promotions go at once on a second copy stream
+  (`STRATA_GLM_BG_LANE=<KiB a lane expert>:<KiB off>[:<kinds>[:<max KiB>]]`, default `512:128:1` there, `0` off).
+  VRAM hits V4 72.7 -> 77.0%, GLM-5.3 61.6 -> 66.6%; CPU lane V4 7.0 -> 6.2 ms a token, GLM-5.3 11.8 -> 10.7. With a
+  24 GB pool V4 +8.1%, GLM-5.3 +4.0%; 16 GB +0.5% / +2.8%; 32K prompts GLM-5.3 +4.6%, V4 +0.6%; V4 + DSpark
+  unchanged. Not for Qwen3.8 (its ~30 us lane experts leave no gap: -7.5%) or HIP (not measured on AMD).
+  `STRATA_GLM_BG_IDLE=<KiB>:<kinds>:<kinds>` (experimental) sends a fixed amount after the route instead.
+- **Windows: the CUDA build passes again.** v1.3.132's `qwen35_fast.cu` includes `<cooperative_groups.h>`, whose CUDA 13
+  CCCL stops with `#error` under MSVC's traditional preprocessor; CUDA files are now compiled with
+  `-Xcompiler=/Zc:preprocessor` under MSVC.
+- Manual (EN/JA): `STRATA_GLM_BG_LANE`, `STRATA_GLM_BG_IDLE`.
+
+Answers: `STRATA_DETERMINISTIC=1` greedy md5 equal to v1.3.132 on V4 0731, GLM-5.3 and V4.1; with the exact lane and
+moves on (`STRATA_GLM_CPU_EXACT=1 STRATA_GLM_LANE_XC=1`) V4 and GLM-5.3 give v1.3.132's tokens with 4-10 points
+different hits. AMD: the changed HIP files compile for gfx1201 / gfx1151; not run on an AMD card.
+
+## v1.3.132 - 2026-11-12
+
+Decode speed on NVIDIA for all four models, the same answers. RTX 5090 (OCuLink Gen4 x4) + Ryzen AI Max+ 395, 123 GB
+RAM, iGPU off, 4K prompt + 512 tokens, greedy, median of 3 runs against v1.3.131 (Qwen3.8: 3 prompts x 3 runs):
+
+| model | v1.3.131 | v1.3.132 |
+|---|---:|---:|
+| Qwen3.8-Flash-Next UD 3.1 UD-IQ3_XXS, no drafter | 95.4 tok/s | **142.2** (+49.0%) |
+| Qwen3.8-Flash-Next UD 3.1 UD-IQ3_XXS, MTP | 143.2 | **197.6** (+38.0%) |
+| DeepSeek V4 0731 UD-Q2_K_XL | 53.7 | **58.2** (+8.3%) |
+| GLM-5.3-Flash Maya-S-v2 IQ2_XXS | 43.8 | **46.0** (+5.1%) |
+| DeepSeek V4.1 Compact JA256 (32G96G) | 47.3 | **49.0** (+3.6%) |
+| DeepSeek V4.1 1017 UD-IQ2_XXS (SSD-bound) | 20.0 | 20.3 (+1.4%, within noise) |
+| Ornith-1.5-122B 24G64G | 59.0 | 60.4 (+2%, within noise) |
+
+- **The background tier moves keep what the text is using (GLM-5.3, DeepSeek V4 / V4.1, Qwen3.8).** They ranked
+  experts by integer route counts halved every 32K routes, which swapped often and followed the current text poorly.
+  They now rank by counts that decay by 0.995 every token boundary (about 200 tokens of memory); a RAM-tier expert
+  replaces its layer's coldest resident when its count passes that one's by 2, at most 8 swaps a boundary
+  (`STRATA_GLM_BG_DECAY` / `_N` / `_MARGIN`, `0` = the old counts). Weights move, the arithmetic does not: VRAM hits
+  V4 66 -> 72%, GLM-5.3 57 -> 62%, Qwen3.8 UD 3.1 93 -> 97.5%, and the CPU lane takes 10-20% fewer experts a token.
+  Qwen3.8 alone: 128.5 -> 136.1 tok/s (MTP 185.5 -> 196.6); with a 16 GB pool +5.9% / +11.1%; on a CPU without AVX-512
+  (AVX2 rows) +8.3% / +11.7%, because the CPU lane does a third of the work it did. GLM-5.3 / V4 with a 24 GB pool
+  +3-4%, 16 GB unchanged; 32K prompts +3%; V4 + DSpark unchanged. On HIP only Qwen3.8 uses it (the others not measured
+  on AMD).
+- **Qwen3.8 on RTX 50 cards: programmatic dependent launch (PDL) on by default** (discrete sm_120+; it was on for the
+  DGX Spark only): a kernel starts while the one before finishes. UD 3.1 4K + 512: 128.0 -> 137.8 tok/s without a
+  drafter, 178.6 -> 184.7 with MTP; 16G64G 121.5 -> 129.0 / 168.9 -> 175.1. `STRATA_GLM_PDL=0` turns it off. The MTP
+  verify window's per-layer CUDA graphs are captured with PDL edges too (`STRATA_Q4X_GRAPH_PDL`; same speed, kept for
+  the next window work). GLM-5.3 / V4 / V4.1 measured no gain and keep PDL off on a discrete card.
+- **Qwen3.8 decode, smaller pieces (CUDA, each the same bits):**
+  - the delta-net middle (alpha / beta, conv + SiLU, the recurrence) in one launch after the qkv / z GEMV
+    (`STRATA_Q4X_GDN_MID`; sm_90+; `STRATA_Q4X_GDN_MID_PF=1` also pulls `ssm_out` into L2, off: slower);
+  - the hyper-connection mix fused for the Q8_0 down / up + F32 inject of the unsloth UD 3.1 and our 16G64G packs
+    (was five launches);
+  - the route's top-k by ranks over 8 warps (8.8k -> 7.8k cycles in the route kernel), QSA top-k digit search by 256
+    threads (14.5 -> 7.2 us a query at 4.6K cells), the step record by a kernel instead of two copies queued behind the
+    expert copies, the indexer rope a thread a pair, argmax over 128 blocks (17 -> 4.2 us a token), the next token's
+    boundary while the head runs (209 -> 16 us gap), the greedy token's PLE rows prefetched;
+  - CPU lane (AVX-512): IQ2_S 17.4 -> 11.3 ns, IQ3_XXS 7.0 -> 5.8 ns, IQ4_NL down 10.6 -> 5.6 ns a block, the window's
+    columns quantized and summed on the pool;
+  - background copies paced at 512 KiB a MoE layer (was 1 MiB: the next layer's route writes waited behind it), and
+    700 MB of VRAM kept free on every CUDA card (was 1.5 GB over 12 GB: Qwen3.8 has no DSpark; 432 more expert slots
+    on a 5090). GLM-5.3 / V4 / V4.1 keep 1 MiB and 1.5 GB (512 KiB undid the decayed counts' gain on their 7-8 MB
+    experts; 1.5 GB is v1.3.82's fix for V4.1 + DSpark at 64K).
+  Together on UD 3.1 (merged build against v1.3.130): 97.6 -> 131.2 tok/s without a drafter, 147.1 -> 186.1 with MTP.
+- **Qwen3.8: the same tokens from run to run with default settings for prompts up to ~2,000 tokens.** The exact
+  prompt's light RAM-tier experts went to MMQ under `STRATA_GLM_PREFILL_CPU=0` (which `STRATA_DETERMINISTIC` sets), so
+  a second request's numbers followed which experts the first one had moved into VRAM; and UD 3.1's four layers the
+  exact prompt cannot take (Q2_0 down weights) kept the CPU's timed share. Both fixed: three processes and one with
+  MTP give the same tokens as `STRATA_DETERMINISTIC=1`. Longer prompt chunks keep the timed share and can still part.
+- Debug: `STRATA_GLM_CPU_LANE_BITS=<n>` compares one RAM-tier expert's CPU-lane rows with the GPU's as bits on n
+  random inputs per layer (UD 3.1: 0 of 1,474,560 rows differ); `STRATA_GLM_ROUTE_LOG` records the starting residents.
+- Manual (EN/JA): `STRATA_GLM_BG_DECAY` / `_N` / `_MARGIN`, `STRATA_Q4X_GRAPH_PDL`, `STRATA_Q4X_GDN_MID` / `_PF`; the new
+  defaults of `STRATA_GLM_PDL`, `STRATA_GLM_BG_PACE_KB` and `STRATA_GLM_RESERVE_MB`.
+
+Answers: `STRATA_DETERMINISTIC=1` greedy md5 equal to v1.3.131 on Qwen3.8 (UD 3.1, 16G64G, GSQ IQ3_S; no drafter and
+MTP; code / Japanese / 4K x 256), GLM-5.3, V4 0731 and V4.1. Known: on GLM-5.3 and V4.1 the deterministic tokens
+still depend on the VRAM pool's size (the prompt's light kernel takes only resident experts), as in earlier releases.
+AMD: the changed HIP files compile for gfx1201 / gfx1151; not run on an AMD card (none attached).
+
+## v1.3.131 - 2026-11-11
+
+A fix release for two AMD reports - thank you, hondaru (#42) and tim6300243 (#43):
+
+- **Qwen3.8 with drafts (MTP, DFlash 2) on AMD GPUs (HIP) decodes at its pre-v1.3.125 speed again.** v1.3.125 gave
+  every dense GEMV of Qwen3.8's verify window (the hyper-connection mixes, delta-net / attention projections,
+  `ssm_out` / `attn_output`, the router and shared expert, the output head) the token path's sums, so greedy answers
+  with drafts equal the ones without. On CUDA that GEMV reads the weights once for all columns; on HIP it ran one GEMV
+  a column, so each verify window read the ~4 GB of dense weights and the head once per column. An AI PRO R9700 on
+  Qwen3.8 IQ3_XXS + MTP went 87.0 -> 67.2 tok/s. HIP now keeps the shared-read GEMVs of v1.3.124
+  (`STRATA_Q4X_VERIFY_EXACT`: `1` on CUDA as before, `0` on HIP; `STRATA_DETERMINISTIC` sets `1`). On HIP, greedy
+  answers with drafts can again part from the ones without late in a long answer, as up to v1.3.124. CUDA is
+  unchanged.
+- **HIP: one host read less per CPU-lane wait.** The wait read the exact-combine mask even with the exact combine off
+  (HIP's default); it now reads it only with the combine on.
+- **Windows + AMD: the HIP build passes with Visual Studio's MSVC 14.51** (#43, RX 9060 XT; also #2 / #3). MSVC
+  14.51's `<cmath>` makes `isgreater` .. `isunordered`, `isnormal` and `signbit` `constexpr` (under HIP implicitly
+  `__host__ __device__`), and TheRock 7.14.1's Clang 23 then fails CMake's HIP compiler test ("`__device__` function
+  'isgreater' cannot overload `__host__ __device__` function"). LLVM fixed it by including
+  `__clang_cuda_math_forward_declares.h` before `<cmath>` in `__clang_hip_runtime_wrapper.h` (01d3932); no Windows ROCm
+  SDK has that yet (it comes with ROCm 10.1). Setup on Windows now makes the same one-line move in the SDK's own copy
+  of that header when MSVC is 14.50 or newer, once, keeping the original as `.abyss-orig`; `--check` only warns,
+  `ABYSS_NO_ROCM_HEADER_FIX=1` leaves the SDK alone. README, the manual and [docs/amd](docs/amd/README.md) (EN/JA) give
+  the manual step for an SDK setup cannot write to.
+- Manual (EN/JA): `STRATA_Q4X_VERIFY_EXACT`.
+
+Not run on an AMD card or on Windows here (none attached today): the HIP files compile, the header move was checked against the reported error with ROCm's Clang 23 on Linux, and the CUDA answers are unchanged.
+
+## v1.3.130 - 2026-11-11
+
+Four findings from LarsDrakblod's RTX 4090 field report (#39) - thank you:
+
+- **`--vram-reserve-mib` now works on every model.** The flag was parsed and honored by the qwen4exp path's
+  `--expert-cache auto`, but the GLM runner's expert pool (Qwen3.8, GLM-5.3, DeepSeek V4.1) read only
+  `STRATA_GLM_RESERVE_MB`, so the flag in a Qwen3.8 config did nothing. The flag now sets that reserve too (also the
+  verified runner's pool, which had 1536 MB written in). With both set, the flag wins and the log says so.
+- **Windows build**: `glm_fast.cu`'s `__builtin_memcpy` (which MSVC lacks) is a plain `memcpy`.
+- **Windows setup**: `tools/abyss_setup.py` finds CMake, Ninja and Python in `.venv/Scripts/` (Windows' venv layout)
+  instead of `.venv/bin/`.
+- **Manual**: `STRATA_DETERMINISTIC` is a test switch, not a runtime setting - it freezes the expert tiers, and on a
+  PCIe-bound RTX 4090 it cost 3.7x (54.1 -> 14.6 tok/s); for the same answers in normal use Qwen3.8 has the exact lane
+  combine (`STRATA_GLM_LANE_XC`). The DFlash 2 note adds the 4090's tie with the MTP layer (55.6 vs 56.4 tok/s at
+  86-89% vs 78% acceptance): on a PCIe-bound card a better drafter does not change each window's expert fetches.
+
+- **Qwen3.8 with the iGPU lane no longer decodes slower than without it** (Ryzen AI Max+ 395 + RTX 5090, Qwen3.8
+  16G64G, v1.3.129: iGPU on MTP 132 / default 89 tok/s, iGPU off 141 / 94; with this the iGPU-on box takes the
+  CPU lane, as iGPU off). The start-up timing that picks the iGPU or
+  the CPU for the RAM-tier lane saw a near tie on Qwen3.8 (an expert 0.022 ms vs 0.019-0.025 on the CPU) and flipped
+  run to run, and every run that picked the iGPU was slower. The iGPU now takes the lane only when it times at least
+  1.5x faster (`STRATA_GLM_IGPU_MARGIN`; GLM-5.3, V4 and V4.1 time it 1.9-2.7x faster and keep it), and never with
+  the exact combine (`STRATA_GLM_LANE_XC`, Qwen3.8's default): the iGPU's sums are not the GPU's bits, so the
+  same-answers-every-run combine needs the CPU lane. `STRATA_GLM_IGPU=1` still forces the iGPU.
+
+- **Opt-in: an expert's SSD chunks all read at once** (`STRATA_GLM_DISK_PAR=1`, off by default until measured). While
+  answering, an expert a token misses is read as 24 chunks (3 parts x `STRATA_GLM_READ_CHUNKS` 8) by 9 threads, about
+  three rounds; the switch gives these reads a pool of their own with a thread a chunk (`<n>`: n threads). Only the
+  order of the reads changes, so the answers are the same. fio on the 6.7 GB/s NVMe: 9 reads at once 4.64 GB/s, 24 at
+  once 5.10. `STRATA_GLM_TIMING=1` now also prints the disk waits fio-style (rate while waiting, mean / p50 / p90 / p99
+  of a one-expert wait), with the switch on or off.
+- **A GPU lost during the start-up fill now says so.** The warm-up checks its copies to VRAM and the table upload and
+  names the CUDA error with a hint (Xid in the kernel log, reboot, reseat an external link), instead of "the warmed
+  expert tables did not upload" (an RTX 5090 on OCuLink fell off the bus there on 2026-11-10).
+
+- **A bigger automatic RAM tier on machines with 100 GiB of RAM or more** (Linux, a discrete GPU, no
+  `STRATA_GLM_RAM_GB`). The cap was 73% of the RAM (`STRATA_GLM_RAM_FRAC`), set on a 94 GB machine where pinning
+  more thrashed; the room the page cache, the server and the desktop need does not grow with the RAM, so a 123.5 GiB
+  machine left 34 GB unpinned (88.7 GB tier). From 100 GiB of RAM the cap is now the larger of 73% and the RAM less
+  24 GB (`STRATA_GLM_RAM_KEEP_GB`): 99.5 GB there (227 GB on a 251 GiB machine), still below the free RAM less
+  `STRATA_GLM_RAM_HEADROOM_GB`. DeepSeek V4.1 UD-IQ2_XXS on an RTX 5090 (iGPU off): 30.2 -> 34.5 tok/s. 64 and 96 GB
+  machines keep the 73% cap byte for byte (45.6 / 68.6 GB on 62.5 / 94 GiB); setting `STRATA_GLM_RAM_KEEP_GB` uses the
+  keep there too. If other programs grow by more than ~8 GB after the engine starts, set `STRATA_GLM_RAM_KEEP_GB=32`.
+  `STRATA_GLM_RAM_FRAC` set on its own keeps the old cap; unified memory (DGX Spark, APUs) and Windows are unchanged.
+  The `RAM tier ... pinned` log line now says how its budget was set.
+
 ## v1.3.129 - 2026-11-10
 
 - **GLM-5.3 and DeepSeek V4.1 decode back to v1.3.123's speed.** `STRATA_GLM_CPU_EXACT` (v1.3.124: the CPU lane in

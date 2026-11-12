@@ -483,6 +483,18 @@ struct Glm5Model::FastState {
     std::unique_ptr<strata::kernels::PleTable> ple;
     std::vector<int32_t> ple_toks;
     bool ple_issued = false;
+    // STRATA_Q4X_PLE_SPEC: the next token's rows prefetched as soon as this token is known (the greedy guess = it);
+    // a token that matches the guess issues its rows only before layer 1, after the prefetch landed (cache hits)
+    int32_t ple_spec_tok = -1;
+    int64_t ple_spec_p = -1;
+    bool ple_deferred = false, ple_spec_live = false;
+    uint32_t ple_rows[16] = {};
+    // STRATA_Q4X_EARLY_BOUNDARY: the next token's boundary scan run while this token's head computes (ev_body: the
+    // layers done); early_b_pos: the position whose boundary already ran (-1: none)
+    cudaEvent_t ev_body = nullptr;
+    int64_t early_b_pos = -1;
+    void* am_scratch = nullptr;    // gf::argmax_mb's (qwen4exp's token head, STRATA_Q4X_ARGMAX_MB)
+    float* ple_emb_hd = nullptr;   // ple_emb_h as the device sees it (mapped): a kernel reads it, no copy engine
     int ple_il = -1;                                             // the PLE layer (-1: none on this part)
     float *ple_emb_h = nullptr, *ple_emb = nullptr, *ple_kp = nullptr, *ple_val = nullptr, *ple_hist = nullptr;
     float *ple_key = nullptr, *ple_norm = nullptr, *ple_gated = nullptr, *ple_conv = nullptr, *ple_gate = nullptr;
@@ -538,6 +550,10 @@ struct Glm5Model::FastState {
     std::vector<LayerPool> lp;   // indexed by absolute layer
     std::vector<int> slot_of;    // il * n_expert + e -> slot in lp[il], -1 absent
     std::vector<uint32_t> cnt;   // il * n_expert + e -> LFU count (aged), over both tiers
+    // the background moves' DECAYED counts (STRATA_GLM_BG_DECAY): a route adds bg_inc, which grows by 1 / decay at
+    // each boundary (so every count decays by `decay` a boundary without touching them); rescaled when it gets large
+    std::vector<float> bgc;
+    std::atomic<float> bg_inc{1.0f};
     // ... and the long memory: routes per key across sessions (expert_usage.txt), halved when one passes 2^30 -
     // the warm-up fills the tiers in its order (this user's experts first)
     std::vector<uint32_t> usage;
@@ -618,21 +634,45 @@ struct Glm5Model::FastState {
         cudaEvent_t ev;   // the move's: recorded after its last piece
         cudaMemcpyKind kind;   // a promotion (H2D) or a swap's demotion (D2H: posted writes, which the GPU's zero-copy
                                // read requests may not pass - they held the token's reads up the same way)
+        cudaStream_t own = nullptr;   // the stream its first bytes went on: the rest follow there (its event then
+                                      // follows every piece; STRATA_GLM_BG_LANE drains on two streams)
     };
     std::vector<BgPiece> bg_q;   // in issue order
     size_t bg_q_at = 0;          // the first piece not fully issued
     size_t bg_pace = 0;
     cudaEvent_t ev_bgq = nullptr;
-    // up to `budget` bytes of the queued copies onto the copy stream, after the work queued on `s` so far (s null:
-    // at once)
-    void bg_drain(cudaStream_t s, size_t budget) {
+    // STRATA_GLM_BG_IDLE (off by default): the link's idle time inside a MoE layer is used too.  The drain after the
+    // CPU-lane answer (bg_pace, above) runs beside the next layer's attention; an RTX 5090 + Gen4 x4 nsys trace of V4
+    // 0731 (4K + 256) showed that window ~160 us long and the link 96% idle from the route to the answer (~215 us),
+    // where the CPU lane computes from RAM.  bg_moe more bytes go right after the route (its request and fence done),
+    // of the kinds in bg_moe_mask (1 H2D, 2 D2H); bg_attn_mask the kinds of the drain after the answer
+    size_t bg_moe = 0;
+    int bg_moe_mask = 3, bg_attn_mask = 3;
+    // STRATA_GLM_BG_LANE (off by default): the service thread itself lets queued copies go (on copy2, at once) when a
+    // route hands the CPU lane ne experts: bg_lane_per x ne - bg_lane_off bytes (at most bg_lane_max) of the kinds in
+    // bg_lane_mask - about what crosses the link while the CPU computes them, so the copy ends before the answer
+    size_t bg_lane_per = 0, bg_lane_off = 0, bg_lane_max = 0;
+    int bg_lane_mask = 1;
+    cudaStream_t copy2 = nullptr;
+    std::mutex bg_mu;   // bg_q and the moves' queued flags: the main thread's drains vs the service thread's
+    // up to `budget` bytes of the queued copies (of the kinds in `mask`: 1 promotions H2D, 2 demotions D2H) onto the
+    // copy stream, in issue order, after the work queued on `s` so far (s null: at once)
+    void bg_drain(cudaStream_t s, size_t budget, int mask = 3, cudaStream_t on = nullptr) {
+        std::lock_guard<std::mutex> lk(bg_mu);
         if (bg_q_at == bg_q.size()) return;
-        if (s != nullptr) {
-            cudaEventRecord(ev_bgq, s);
-            cudaStreamWaitEvent(copy, ev_bgq, 0);
-        }
-        while (bg_q_at < bg_q.size() && budget > 0) {
-            BgPiece& p = bg_q[bg_q_at];
+        cudaStream_t copy = on != nullptr ? on : this->copy;
+        bool waited = false;
+        for (size_t i = bg_q_at; i < bg_q.size() && budget > 0; ++i) {
+            BgPiece& p = bg_q[i];
+            if (p.done == p.n || !(mask & (p.kind == cudaMemcpyHostToDevice ? 1 : 2)) ||
+                (p.own != nullptr && p.own != copy))
+                continue;
+            p.own = copy;
+            if (!waited && s != nullptr) {
+                cudaEventRecord(ev_bgq, s);
+                cudaStreamWaitEvent(copy, ev_bgq, 0);
+            }
+            waited = true;
             const size_t n = p.n - p.done < budget ? p.n - p.done : budget;
             cudaMemcpyAsync(p.dst + p.done, p.src + p.done, n, p.kind, copy);
             p.done += n;
@@ -641,8 +681,8 @@ struct Glm5Model::FastState {
             cudaEventRecord(p.ev, copy);
             for (auto& m : bg)
                 if (m.ev == p.ev) m.queued = false;
-            ++bg_q_at;
         }
+        while (bg_q_at < bg_q.size() && bg_q[bg_q_at].done == bg_q[bg_q_at].n) ++bg_q_at;
         if (bg_q_at == bg_q.size()) {
             bg_q.clear();
             bg_q_at = 0;
@@ -668,6 +708,12 @@ struct Glm5Model::FastState {
     std::vector<uint8_t*> stage;   // pinned: disk reads when no RAM slot is free
     std::mutex mu;   // the service thread vs the between-token boundary
     std::unique_ptr<glmfast::Workers> workers;   // parallel disk reads
+    // STRATA_GLM_DISK_PAR (off by default): the decode's miss reads get a pool of their own, sized so every chunk of
+    // an expert (3 parts x read_chunks) is read at once, instead of 9 threads taking 24 chunks in ~3 rounds.  Only
+    // the I/O schedule changes (the same bytes land in the same slots); null = the shared pool above
+    std::unique_ptr<glmfast::Workers> disk_pool;
+    int disk_par = 0;                            // the miss reads' threads with the switch on (the caller included)
+    int shared_readers = 0;                      // ... and the shared pool's (off)
     // ---- the CPU LANE (STRATA_GLM_CPU_LANE=<threads>, 0 off): a route's RAM-tier experts split between the device's
     //      PCIe pulls and this pool, which computes its share from the pinned blobs meanwhile; the device adds the
     //      weighted sum (cpu_ans_h) before its down combine.  cpu_plan: how many of f RAM-tier experts go to the host.
@@ -740,6 +786,12 @@ struct Glm5Model::FastState {
     std::atomic<uint64_t> hits{0}, misses{0}, miss_layers{0}, ram_hits{0}, disk_reads{0}, promotions{0};
     std::atomic<uint64_t> scratch_uses{0}, demotions{0}, drops{0};
     std::atomic<uint64_t> miss_us{0}, disk_us{0};
+    // the decode's disk waits (STRATA_GLM_TIMING=1 prints them): bytes read, and the wait times of the waits that read
+    // exactly one expert in 50 us buckets (the last one is everything from 12.75 ms up)
+    static constexpr int kDiskHist = 256;
+    static constexpr int kDiskHistUs = 50;
+    std::atomic<uint64_t> disk_bytes{0}, disk_one_waits{0}, disk_one_us{0};
+    std::array<std::atomic<uint32_t>, kDiskHist> disk_one_hist{};
     uint64_t tokens = 0;
     double ms = 0;
     // ---- STRATA_GLM_GAP_PROF=1: where the time between two tokens goes.  Host laps (ms, summed): from a token's
@@ -750,6 +802,7 @@ struct Glm5Model::FastState {
     cudaEvent_t ev_gs = nullptr, ev_ge[2] = {nullptr, nullptr}, ev_g0 = nullptr;
     int gap_par = 0;
     std::chrono::steady_clock::time_point t_ready{};
+    double gap_ph[7] = {};
     double gap_host = 0, gap_bsync = 0, gap_bwait = 0, gap_bscan = 0, gap_emb = 0, gap_spin = 0, gap_gpu = 0,
            gap_sample = 0, gap_busy = 0, gap_notice = 0;
     bool token_spin = false;   // STRATA_GLM_TOKEN_SPIN=1: the wait for the token polls without yielding (an experiment)

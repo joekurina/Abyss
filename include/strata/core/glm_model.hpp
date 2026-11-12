@@ -525,6 +525,7 @@ public:
     // ---- qwen35moe (src/core/qwen35_fast_path.cu): the token path (the prompt path, the verify windows and the
     // conversation snapshot are elsewhere; no layer splits yet)
     void* qwen35_state_ = nullptr;                         // the GDN states, conv states, KV caches and activations
+    int q35_kv_ = 0;   // --kv (STRATA_GLM_KV_Q35): the attention layers' cache format, qwen35_fast.hpp's kv (0 FP16)
     void qwen35_bind(int il, std::string& missing);        // fast_setup's layer loop: this layer's weights
     bool qwen35_alloc(std::string& err);
     void qwen35_reset();                                   // a new sequence: the states zeroed (on the fast stream)
@@ -592,6 +593,10 @@ public:
     bool verify_part_glm(const std::vector<int32_t>& toks, int64_t p0, std::string& err);
     void verify_rewind_glm(int64_t pos);
     bool glm_mvn(const void* jobs, int n, int T, cudaStream_t s);   // gf::MvJob[n] (STRATA_GLM_MVN_CHECK)
+    // qwen4exp's verify-window GEMVs: glm_mvn (each column mv()'s sums: the drafts' tokens equal the token path's)
+    // or gf::mvn (the weights read once for all columns) - STRATA_Q4X_VERIFY_EXACT, on by default on CUDA, off on HIP
+    // (HIP's glm_mvn is a mv() a column: the dense weights read once per column, issue #42)
+    bool q4x_mvn(const void* jobs, int n, int T, cudaStream_t s);
     bool glm_window_check(const std::vector<int32_t>& toks, int64_t p0, std::string& err);   // STRATA_GLM_WINDOW_CHECK
     void kda_copy_layer(int il, int li, bool restore, float* bak = nullptr);   // one KDA layer's S + conv <-> kda_bak_
     // the NextN block (blk.<n_layers>) as the drafter on one GPU (qwen35_fast_path.cu, behind the q35_mtp_* hooks)
@@ -632,6 +637,7 @@ public:
     std::string ple_gguf_;                                 // qwen4exp: the shard holding per_layer_token_embd
     bool q4x_ple_setup(std::string& err);
     bool q4x_ple_issue(int32_t token, int64_t p, std::string& err);
+    void q4x_ple_spec(int32_t token, int64_t p);
     bool q4x_ple_apply(std::string& err);
     bool q4x_qsa_setup(std::string& err);
     int64_t q35_snap_pend_ = -1, q35_snap_done_ = -1;
@@ -673,7 +679,7 @@ public:
     void fast_read_expert_x3(int il, int e, uint8_t* blob);   // a whole EXL3 expert in as few reads as it allows
     void fast_ahead_route(int il, const int* ids, unsigned int miss, const short (*ahead)[16]);   // [glmf::kMaxK]   // LOOKAHEAD
     void fast_ahead_reader();
-    bool fast_boundary(std::string& err);                  // between tokens: apply finished promotions
+    bool fast_boundary(std::string& err, bool early = false);   // between tokens: apply finished promotions
     int fast_sample(strata::kernels::SamplerParams& sp, std::string& err);   // this half's logits, sampled on its stream
     int64_t ram_budget_ = -1;                              // bytes of pinned RAM tier for this half (-1: derive)
     float* snap_ = nullptr;                                // the saved KDA states + conv histories (this half)
@@ -834,7 +840,7 @@ public:
         size_t staging = 0, hop = 0;
     };
     PinnedPrompt prefill_pinned() const;
-    static size_t pool_avail(size_t free_b, size_t total_b);   // the expert pool's bytes from the free VRAM
+    static size_t pool_avail(size_t free_b, size_t total_b, bool q4x = false);   // the expert pool's bytes from the free VRAM
     size_t pool_avail_uma(size_t free_b, size_t total_b) const;   // (unified memory + STRATA_GLM_VRAM_GB: as fast_setup)
     bool lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err);
     bool vis_lend_ok_ = false;                             // this half's tail can go to the vision encoder

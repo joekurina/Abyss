@@ -5,6 +5,8 @@
 // MoE (fast_moe: a softmax top-k router, the routed experts through the tiers and the lanes, the shared expert behind
 // its sigmoid gate) -> R += ffn.  No hyper-connections: the residual R is state_ (n_embd floats).  The math follows
 // llama.cpp's src/models/qwen35moe.cpp and delta-net-base.cpp.
+#include <cstring>
+#include <vector>
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/core/knobs.hpp"
@@ -26,6 +28,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 namespace strata::core {
@@ -139,11 +142,23 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
     const size_t S = (size_t) g.ssm_state, HV = (size_t) g.ssm_v_heads, C = (size_t) g.ssm_conv_dim(), V = (size_t) g.ssm_inner;
     const size_t D = (size_t) g.head_dim, HD = (size_t) g.n_head * D, KV = (size_t) g.attn_head_kv * D;
     const size_t ctx = (size_t) std::max<int64_t>(max_ctx_, 1);
-    const size_t state_b = al(S * HV * S * 4), conv_b = al(C * (size_t) (g.d_conv - 1) * 4), cache_b = al(ctx * KV * 2);
+    // --kv (STRATA_GLM_KV_Q35, set by --kv on --glm-pack): 1 q4_0, 2 int8, 3 k8v4 - the caches' rows 144 / 272 / 272 + 144
+    // B a KV head and position against FP16's 512 (qwen35_fast.hpp).  qwen4exp's fast path (its QSA gathers and rows
+    // kernels read FP16) keeps FP16
+    {
+        const char* kv = getenv("STRATA_GLM_KV_Q35");
+        const int want = kv != nullptr ? std::max(0, std::min(3, std::atoi(kv))) : 0;
+        q35_kv_ = !g.q4x && D == 256 ? want : 0;
+        if (want != 0 && q35_kv_ == 0 && l0_ == 0)
+            std::fprintf(stderr, "qwen35moe: --kv is not supported on this model's fast path - the KV cache stays FP16\n");
+    }
+    const size_t row_k = q35_kv_ != 0 ? (size_t) g.attn_head_kv * q35::kv_row_bytes(q35_kv_, false) : KV * 2;
+    const size_t row_v = q35_kv_ != 0 ? (size_t) g.attn_head_kv * q35::kv_row_bytes(q35_kv_, true) : KV * 2;
+    const size_t state_b = al(S * HV * S * 4), conv_b = al(C * (size_t) (g.d_conv - 1) * 4), cache_b = al(ctx * row_k) + al(ctx * row_v);
     int n_rec = 0, n_attn = 0;
     for (int il = l0_; il < lt_; ++il) (F->L[(size_t) il].recr ? n_rec : n_attn) += 1;   // (lt_: the NextN block too)
     const size_t part = q35::attn_part_floats(g.n_head, g.head_dim, (int) ctx);
-    size_t bytes = (size_t) n_rec * (state_b + conv_b) + (size_t) n_attn * 2 * cache_b;
+    size_t bytes = (size_t) n_rec * (state_b + conv_b) + (size_t) n_attn * cache_b;
     bytes += al(C * 4) + al(V * 4) + al(C * 4) + al(2 * HV * 4) + al(HV * 4) + al(V * 4) + al(V * 4) + al(V / 32 * 36) +
              al(HD * 2 * 4) + al(KV * 4) + al(KV * 4) + al(HD * 4) + al(HD * 4) + al(HD / 32 * 36) + al(part * 4) + 256;
     const size_t E = (size_t) g.n_embd, TM = (size_t) kVerifyMax;
@@ -173,8 +188,8 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
             Ly.gdn_state = (float*) take(S * HV * S * 4);
             Ly.gdn_conv = (float*) take(C * (size_t) (g.d_conv - 1) * 4);
         } else {
-            Ly.kc = (uint16_t*) take(ctx * KV * 2);
-            Ly.vc = (uint16_t*) take(ctx * KV * 2);
+            Ly.kc = (uint16_t*) take(ctx * row_k);
+            Ly.vc = (uint16_t*) take(ctx * row_v);
         }
     }
     F->q35_qkv = (float*) take(C * 4);
@@ -221,8 +236,9 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
         }
     }
     std::fprintf(stderr, "qwen35moe: CUDA%d %d delta-net layers (states %.0f MB), %d attention layers (KV caches %.2f GB "
-                         "for %lld tokens)\n", dev_, n_rec, (double) n_rec * (state_b + conv_b) / 1048576.0, n_attn,
-                 (double) n_attn * 2 * cache_b / 1073741824.0, (long long) ctx);
+                         "for %lld tokens%s)\n", dev_, n_rec, (double) n_rec * (state_b + conv_b) / 1048576.0, n_attn,
+                 (double) n_attn * cache_b / 1073741824.0, (long long) ctx,
+                 q35_kv_ == 1 ? ", q4_0" : q35_kv_ == 2 ? ", int8" : q35_kv_ == 3 ? ", k8v4" : "");
     if (g.q4x && l0_ <= 1 && 1 < l1_ && !q4x_ple_setup(err)) return false;
     if (g.q4x && !q4x_qsa_setup(err)) return false;
     // (STRATA_Q4X_DFLASH: DFlash 2 replaces the MTP layer - the two drafters never run together)
@@ -374,6 +390,17 @@ bool Glm5Model::q4x_ple_setup(std::string& err) {
         cudaMemcpy(F->ple_conv16, c16.data(), n_conv * 2, cudaMemcpyHostToDevice);
     }
     F->ple_w.conv1d_f16 = F->ple_conv16;
+    if (cudaMalloc(&F->am_scratch, gf::argmax_mb_scratch_bytes()) == cudaSuccess)
+        cudaMemset(F->am_scratch, 0, gf::argmax_mb_scratch_bytes());
+    else {
+        cudaGetLastError();
+        F->am_scratch = nullptr;
+    }
+    {   // the row's device view (pinned memory is mapped under unified addressing); none: the copy as before
+        void* d = nullptr;
+        if (cudaHostGetDevicePointer(&d, F->ple_emb_h, 0) == cudaSuccess) F->ple_emb_hd = (float*) d;
+        else cudaGetLastError();
+    }
     F->ple.reset(new k::PleTable());
     k::PleIoOptions io;
     if (!F->ple->open(ple_gguf_, err, io)) {
@@ -388,21 +415,54 @@ bool Glm5Model::q4x_ple_setup(std::string& err) {
     return true;
 }
 
+static bool ple_spec_on() {
+    static const bool on = [] { const char* v = getenv("STRATA_Q4X_PLE_SPEC"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
+
+// STRATA_Q4X_PLE_SPEC (default on): the token just produced is the next one's input whenever the caller samples
+// greedily - its 16 table rows are prefetched now, while the host finishes the token and the next one's boundary runs
+// (~0.2 ms that the SSD read used to start after).  Only the row cache changes: a different next token reads its own
+// rows as before, so the outputs are the same either way.  Not with a drafter (its steps prefetch their own rows).
+void Glm5Model::q4x_ple_spec(int32_t token, int64_t p) {
+    FastState* F = fast_;
+    namespace k = strata::kernels;
+    F->ple_spec_p = -1;
+    if (!ple_spec_on() || F->ple == nullptr || q35_mtp_on() || dfl_ != nullptr || dsp_ != nullptr) return;
+    if (F->ple_issued || p < 1 || (size_t) p >= F->ple_toks.size()) return;
+    const int32_t prev[2] = {p >= 2 ? F->ple_toks[(size_t) p - 2] : -1, F->ple_toks[(size_t) p - 1]};
+    static const k::PleConsts consts = k::ple_artifact_consts();
+    uint32_t rows[k::PLE_N_HEADS];
+    k::ngram_rows(&token, prev, 1, consts, rows);
+    F->ple->prefetch(rows, k::PLE_N_HEADS);
+    F->ple_spec_live = true;
+    F->ple_spec_tok = token;
+    F->ple_spec_p = p;
+}
+
 bool Glm5Model::q4x_ple_issue(int32_t token, int64_t p, std::string& err) {
     FastState* F = fast_;
     namespace k = strata::kernels;
     if (F->ple == nullptr) return true;
     if (F->ple_issued) {   // (a token whose layers never ran: its rows are dropped)
-        if (!F->ple->collect(F->ple_emb_h, err)) return false;
-        F->ple_issued = false;
+        if (!F->ple_deferred && !F->ple->collect(F->ple_emb_h, err)) return false;
+        F->ple_issued = F->ple_deferred = false;
     }
     const size_t n = F->ple_toks.size();
+    // (the guess's history: the same two earlier tokens - ple_toks below p is not rewritten in between)
+    const bool spec_hit = F->ple_spec_p >= 0 && F->ple_spec_p == p && F->ple_spec_tok == token;
+    F->ple_spec_p = -1;
     if (p >= 0 && (size_t) p < n) F->ple_toks[(size_t) p] = token;
     const int32_t prev[2] = {p >= 2 && (size_t) p - 2 < n ? F->ple_toks[(size_t) p - 2] : -1,
                              p >= 1 && (size_t) p - 1 < n ? F->ple_toks[(size_t) p - 1] : -1};
     static const k::PleConsts consts = k::ple_artifact_consts();
     uint32_t rows[k::PLE_N_HEADS];
     k::ngram_rows(&token, prev, 1, consts, rows);
+    if (spec_hit) {   // (the prefetch is in flight: the rows are issued before layer 1, from the cache)
+        std::memcpy(F->ple_rows, rows, sizeof rows);
+        F->ple_issued = F->ple_deferred = true;
+        return true;
+    }
     if (!F->ple->issue(rows)) {
         err = "qwen4exp: the PLE rows could not be issued";
         return false;
@@ -421,10 +481,27 @@ bool Glm5Model::q4x_ple_apply(std::string& err) {
         err = "qwen4exp: layer 1 ran without its PLE rows";
         return false;
     }
+    if (F->ple_deferred) {   // (STRATA_Q4X_PLE_SPEC's guess was right: wait for its reads, then the cache answers)
+        F->ple->reap_prefetches();
+        F->ple_spec_live = false;
+        if (!F->ple->issue(F->ple_rows)) { err = "qwen4exp: the PLE rows could not be issued"; return false; }
+        F->ple_deferred = false;
+    }
     if (!F->ple->collect(F->ple_emb_h, err)) { err = "qwen4exp: PLE: " + err; return false; }
     F->ple_issued = false;
+    if (F->ple_spec_live) {   // (a wrong guess: its reads were issued a token ago - drop the tickets)
+        F->ple->reap_prefetches();
+        F->ple_spec_live = false;
+    }
     const int E = g.n_embd, HE = g.hc * E;
-    cudaMemcpyAsync(F->ple_emb, F->ple_emb_h, (size_t) E * 4, cudaMemcpyHostToDevice, s);
+    // STRATA_Q4X_PLE_MAPPED=1 (default off): a kernel reads the row from the mapped pinned buffer instead of the 10 KB
+    // copy (which can queue behind the background expert copies); the same bytes.  RTX 5090 nsys: the kernel took
+    // 11.0 us over PCIe against the copy's 6.4, so the copy stays the default
+    static const bool mapped = [] { const char* v = getenv("STRATA_Q4X_PLE_MAPPED"); return v != nullptr && std::atoi(v) != 0; }();
+    if (mapped && F->ple_emb_hd != nullptr)
+        q35::copy_f32(F->ple_emb, F->ple_emb_hd, E, s);
+    else
+        cudaMemcpyAsync(F->ple_emb, F->ple_emb_h, (size_t) E * 4, cudaMemcpyHostToDevice, s);
     gf::quantize_q8_1(F->ple_emb, F->ple_embq, E, s);
     gf::MvJob j[2];
     j[0] = {F->ple_key_w.q, F->ple_embq, F->ple_emb, F->ple_kp, nullptr, 1.0f, F->ple_key_w.type, E, HE};
@@ -573,7 +650,7 @@ bool Glm5Model::q35_mtp_rows(int64_t p0, int n, const float* h_rows, size_t h_st
     j[1] = {Ly.av.q, F->q35_mt_xq, F->q35_mt_x, F->q35_mt_v, nullptr, 1.0f, Ly.av.type, E, KV};
     if (!gf::mvn(j, 2, n, s)) { err = "qwen35 mtp: k / v rows"; return false; }
     q35::attn_kv_rows(F->q35_mt_k, F->q35_mt_v, Ly.k_norm, g.norm_eps, g.attn_head_kv, D, g.n_rot, g.rope_base, p0, n,
-                      Ly.kc, Ly.vc, s);
+                      Ly.kc, Ly.vc, s, q35_kv_);
     q35_row_done_ = std::max(q35_row_done_, p0 + n - 1);
     return true;
 }
@@ -824,6 +901,96 @@ bool Glm5Model::fast_qwen35_gdn(int il, std::string& err) {
     cudaStream_t s = F->cs;
     const auto& Ly = F->L[(size_t) il];
     const int E = g.n_embd, C = g.ssm_conv_dim(), V = g.ssm_inner, S = g.ssm_state, HK = g.ssm_k_heads, HV = g.ssm_v_heads;
+    static const bool old_step = getenv("STRATA_Q35_GDN_STEP") != nullptr;
+    static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
+    // qwen4exp on CUDA (sm_90+): alpha / beta, the conv + SiLU and gdn_core in ONE launch after the qkv / z GEMV
+    // (q35::gdn_mid: the same arithmetic in the same order, the same bits - gdn_core_parity), which also pulls ssm_out's
+    // weights toward L2 while the recurrence runs if STRATA_Q4X_GDN_MID_PF=1 (off: UD 3.1 decode 120.5 with it, 122.7
+    // without - it competes with the state's reads).  STRATA_Q4X_GDN_MID=0: the launches below.  HIP: never
+    static const bool mid_env = [] { const char* v = getenv("STRATA_Q4X_GDN_MID"); return v == nullptr || std::atoi(v) != 0; }();
+    static const bool mid_pf = [] { const char* v = getenv("STRATA_Q4X_GDN_MID_PF"); return v != nullptr && std::atoi(v) != 0; }();
+    static const bool gdn_fuse0 = [] { const char* v = getenv("STRATA_Q4X_GDN_FUSE"); return v == nullptr || std::atoi(v) != 0; }();
+    const bool ab_typed = (Ly.alpha_w.type == gf::kTypeF32 || Ly.alpha_w.type == gf::kTypeBF16) &&
+                          Ly.beta_w.type == Ly.alpha_w.type;
+    if (g.q4x && mid_env && gdn_fuse0 && !old_step && !dumps && ab_typed && q35::gdn_mid_ok(S, HK, HV, g.d_conv, E)) {
+        gf::MvJob j2[2];
+        j2[0] = {Ly.qkv.q, F->xq, F->x, F->q35_qkv, nullptr, 1.0f, Ly.qkv.type, E, C};
+        j2[1] = {Ly.zg.q, F->xq, F->x, F->q35_z, nullptr, 1.0f, Ly.zg.type, E, V};
+        if (!gf::mv(j2, 2, s)) { err = "qwen35moe: the delta-net projections"; return false; }
+        if (F->prof_on) F->mark("q35_gdn_mv");
+        const size_t orb = mid_pf ? gf::row_bytes(Ly.ssm_o.type, V) : 0;
+        // STRATA_Q4X_GDN_MID_CHECK=<n> (debug): the first n calls also run the old launches from the same state and
+        // compare the bytes (state, conv state, y, y's q8_1); the old launches' results are kept
+        static const int mid_check = [] { const char* v = getenv("STRATA_Q4X_GDN_MID_CHECK"); return v ? std::atoi(v) : 0; }();
+        static int mid_checked = 0;
+        if (mid_checked < mid_check) {
+            ++mid_checked;
+            const size_t nst = (size_t) S * HV * S, ncs = (size_t) C * (g.d_conv - 1), nyq = (size_t) V / 32 * 36;
+            static float *st0 = nullptr, *cs0 = nullptr;
+            if (st0 == nullptr) { cudaMalloc(&st0, nst * 4); cudaMalloc(&cs0, ncs * 4); }
+            cudaMemcpyAsync(st0, Ly.gdn_state, nst * 4, cudaMemcpyDeviceToDevice, s);
+            cudaMemcpyAsync(cs0, Ly.gdn_conv, ncs * 4, cudaMemcpyDeviceToDevice, s);
+            q35::gdn_mid(Ly.gdn_state, Ly.gdn_conv, F->q35_qkv, Ly.conv1d, g.d_conv, F->x, Ly.alpha_w.q, Ly.beta_w.q,
+                         Ly.alpha_w.type == gf::kTypeBF16, E, S, HK, HV, g.norm_eps, Ly.dt_bias, Ly.ssm_a, F->q35_z,
+                         Ly.ssm_norm, g.norm_eps, F->q35_h, F->q35_ab, F->q35_y, F->q35_yq, nullptr, 0, s);
+            std::vector<float> a_st(nst), a_cs(ncs), a_y(V), a_h(C), a_ab(2 * HV);
+            std::vector<uint8_t> a_yq(nyq);
+            cudaStreamSynchronize(s);
+            cudaMemcpy(a_st.data(), Ly.gdn_state, nst * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(a_cs.data(), Ly.gdn_conv, ncs * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(a_y.data(), F->q35_y, V * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(a_yq.data(), F->q35_yq, nyq, cudaMemcpyDeviceToHost);
+            cudaMemcpy(a_h.data(), F->q35_h, C * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(a_ab.data(), F->q35_ab, 2 * HV * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(Ly.gdn_state, st0, nst * 4, cudaMemcpyDeviceToDevice);
+            cudaMemcpy(Ly.gdn_conv, cs0, ncs * 4, cudaMemcpyDeviceToDevice);
+            gf::MvJob ab[2];
+            ab[0] = {Ly.alpha_w.q, F->xq, F->x, F->q35_ab, nullptr, 1.0f, Ly.alpha_w.type, E, HV};
+            ab[1] = {Ly.beta_w.q, F->xq, F->x, F->q35_ab + HV, nullptr, 1.0f, Ly.beta_w.type, E, HV};
+            gf::mv(ab, 2, s);
+            q35::conv_silu_step(Ly.gdn_conv, F->q35_qkv, Ly.conv1d, C, g.d_conv, F->q35_h, s);
+            std::vector<float> b_ab(2 * HV), b_h(C);
+            cudaStreamSynchronize(s);
+            cudaMemcpy(b_ab.data(), F->q35_ab, 2 * HV * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(b_h.data(), F->q35_h, C * 4, cudaMemcpyDeviceToHost);
+            q35::gdn_core(Ly.gdn_state, F->q35_h, 1, C, F->q35_ab, F->q35_ab + HV, S, HK, HV, true, g.norm_eps, Ly.dt_bias,
+                          Ly.ssm_a, F->q35_z, Ly.ssm_norm, g.norm_eps, F->q35_y, F->q35_yq, s);
+            std::vector<float> b_st(nst), b_cs(ncs), b_y(V);
+            std::vector<uint8_t> b_yq(nyq);
+            cudaStreamSynchronize(s);
+            cudaMemcpy(b_st.data(), Ly.gdn_state, nst * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(b_cs.data(), Ly.gdn_conv, ncs * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(b_y.data(), F->q35_y, V * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(b_yq.data(), F->q35_yq, nyq, cudaMemcpyDeviceToHost);
+            const auto cmpf = [&](const char* nm, const std::vector<float>& a, const std::vector<float>& b) {
+                size_t n = 0, first = 0;
+                for (size_t i = 0; i < a.size(); ++i)
+                    if (std::memcmp(&a[i], &b[i], 4) != 0) { if (n++ == 0) first = i; }
+                if (n) std::fprintf(stderr, "gdn_mid check L%d %s: %zu differ, first %zu: %.9g vs %.9g\n", il, nm, n, first,
+                                    a[first], b[first]);
+                return n;
+            };
+            size_t bad = cmpf("ab", a_ab, b_ab) + cmpf("h", a_h, b_h) + cmpf("state", a_st, b_st) + cmpf("conv", a_cs, b_cs) +
+                         cmpf("y", a_y, b_y) + (a_yq != b_yq ? 1 : 0);
+            std::fprintf(stderr, "gdn_mid check L%d (HK %d HV %d C %d E %d dc %d ab type %d): %s\n", il, HK, HV, C, E,
+                         g.d_conv, Ly.alpha_w.type, bad ? "DIFF" : "same");
+            gf::MvJob o = {Ly.ssm_o.q, F->q35_yq, F->q35_y, F->mixer, nullptr, 1.0f, Ly.ssm_o.type, V, E};
+            if (!gf::mv(&o, 1, s)) { err = "qwen35moe: ssm_out"; return false; }
+            return true;
+        }
+        if (q35::gdn_mid(Ly.gdn_state, Ly.gdn_conv, F->q35_qkv, Ly.conv1d, g.d_conv, F->x, Ly.alpha_w.q, Ly.beta_w.q,
+                         Ly.alpha_w.type == gf::kTypeBF16, E, S, HK, HV, g.norm_eps, Ly.dt_bias, Ly.ssm_a, F->q35_z,
+                         Ly.ssm_norm, g.norm_eps, nullptr, nullptr, F->q35_y, F->q35_yq, orb ? Ly.ssm_o.q : nullptr,
+                         orb * (size_t) E, s)) {
+            if (F->prof_on) F->mark("q35_gdn");
+            gf::MvJob o = {Ly.ssm_o.q, F->q35_yq, F->q35_y, F->mixer, nullptr, 1.0f, Ly.ssm_o.type, V, E};
+            if (!gf::mv(&o, 1, s)) { err = "qwen35moe: ssm_out"; return false; }
+            if (F->prof_on) F->mark("q35_gdn_out");
+            return true;
+        }
+        err = "qwen35moe: gdn_mid";
+        return false;
+    }
     // 1. the projections: qkv (C), z (V), alpha and beta (h_v each) in one launch
     gf::MvJob j[4];
     j[0] = {Ly.qkv.q, F->xq, F->x, F->q35_qkv, nullptr, 1.0f, Ly.qkv.type, E, C};
@@ -832,7 +999,6 @@ bool Glm5Model::fast_qwen35_gdn(int il, std::string& err) {
     j[3] = {Ly.beta_w.q, F->xq, F->x, F->q35_ab + HV, nullptr, 1.0f, Ly.beta_w.type, E, HV};
     if (!gf::mv(j, 4, s)) { err = "qwen35moe: the delta-net projections"; return false; }
     if (F->prof_on) F->mark("q35_gdn_mv");
-    static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
     if (dumps) {
         q35_dump(s, "linear_attn_qkv_mixed", il, F->q35_qkv, C);
         q35_dump(s, "z", il, F->q35_z, V);
@@ -847,7 +1013,6 @@ bool Glm5Model::fast_qwen35_gdn(int il, std::string& err) {
         q35_dump(s, "k_conv", il, F->q35_h + (size_t) HK * S, (int64_t) HK * S);
         q35_dump(s, "v_conv", il, F->q35_h + (size_t) 2 * HK * S, (int64_t) HV * S);
     }
-    static const bool old_step = getenv("STRATA_Q35_GDN_STEP") != nullptr;
     // qwen4exp: the heads' L2 norm, the gates, the recurrence, the output norm and y's q8_1 in one launch
     // (q35::gdn_core, the same bits as the launches below - gdn_core_parity).  STRATA_Q4X_GDN_FUSE=0: those launches.
     // Off by default with HIP (unmeasured there): STRATA_Q4X_GDN_FUSE=1 there
@@ -929,7 +1094,7 @@ bool Glm5Model::fast_qwen35_attn(int il, int64_t p64, std::string& err) {
         q35_dump(s, "Vcur", il, F->q35_v, KV);
     }
     q35::attn_prep(F->q35_qf, F->q35_k, F->q35_v, Ly.q_norm, Ly.k_norm, g.norm_eps, g.n_head, g.attn_head_kv, D, g.n_rot,
-                   g.rope_base, p, Ly.kc, Ly.vc, F->q35_q, s);
+                   g.rope_base, p, Ly.kc, Ly.vc, F->q35_q, s, q35_kv_);
     namespace k = strata::kernels;
     int width = p + 1;
     // STRATA_Q4X_QSA_DECODE (on for CUDA, off on HIP): the QSA layer's attention reads its cells in place, a few query
@@ -945,8 +1110,21 @@ bool Glm5Model::fast_qwen35_attn(int il, int64_t p64, std::string& err) {
         if (F->q4_step_at != p64) {   // the step record and the rows' positions, once a token
             k::qsa_step_fill(F->q4_step_h, p64, sh);
             for (int h = 0; h < 64; ++h) F->q4_pos_h[h] = p;
-            cudaMemcpyAsync(F->q4_step, F->q4_step_h, k::qsa_step_bytes(), cudaMemcpyHostToDevice, s);
-            cudaMemcpyAsync(F->q4_pos, F->q4_pos_h, 256, cudaMemcpyHostToDevice, s);
+            // STRATA_Q4X_STEP_KERNEL (CUDA default on, HIP off): a tiny kernel writes them (the values by argument) -
+            // the two copies waited ~20 us a token behind the background expert copies on the copy engine
+#if defined(STRATA_USE_HIP)
+            static const bool sk = [] { const char* v = getenv("STRATA_Q4X_STEP_KERNEL"); return v != nullptr && std::atoi(v) != 0; }();
+#else
+            static const bool sk = [] { const char* v = getenv("STRATA_Q4X_STEP_KERNEL"); return v == nullptr || std::atoi(v) != 0; }();
+#endif
+            static_assert(k::kStepCount == 4, "q4_step_set writes 4 ints");
+            if (sk) {
+                const int32_t* hs = F->q4_step_h;
+                q35::q4_step_set(F->q4_step, F->q4_pos, hs[0], hs[1], hs[2], hs[3], p, s);
+            } else {
+                cudaMemcpyAsync(F->q4_step, F->q4_step_h, k::qsa_step_bytes(), cudaMemcpyHostToDevice, s);
+                cudaMemcpyAsync(F->q4_pos, F->q4_pos_h, 256, cudaMemcpyHostToDevice, s);
+            }
             F->q4_step_at = p64;
         }
         const k::QsaIndexerBuffers ib{Ly.q4_tail, Ly.q4_dead, Ly.q4_pooled, Ly.q4_bpos};
@@ -956,8 +1134,14 @@ bool Glm5Model::fast_qwen35_attn(int il, int64_t p64, std::string& err) {
         width = dense ? p + 1 : (int) k::qsa_selection_width(p64 + 1, sh);
         if (width < p + 1) {   // past 2,051 cells: the indexer's selection, gathered
             k::rms_norm_weighted(F->q4_iq, Ly.q4_iqn, g.idx_heads, g.idx_key, g.norm_eps, (void*) s);
-            k::rope_neox_apply(F->q4_iq, F->q4_iq, g.idx_heads, g.idx_key, g.n_rot, F->q4_cos, F->q4_sin, F->q4_pos,
-                               (void*) s);
+            // STRATA_Q4X_ROPE_PAIRS (CUDA default on): a thread a pair, not a thread a row (the same bits, ~4.5 us a layer)
+#if defined(STRATA_USE_HIP)
+            static const bool rp = [] { const char* v = getenv("STRATA_Q4X_ROPE_PAIRS"); return v != nullptr && std::atoi(v) != 0; }();
+#else
+            static const bool rp = [] { const char* v = getenv("STRATA_Q4X_ROPE_PAIRS"); return v == nullptr || std::atoi(v) != 0; }();
+#endif
+            (rp ? k::rope_neox_apply_pairs : k::rope_neox_apply)(F->q4_iq, F->q4_iq, g.idx_heads, g.idx_key, g.n_rot,
+                                                                 F->q4_cos, F->q4_sin, F->q4_pos, (void*) s);
             k::qsa_block_scores(Ly.q4_pooled, Ly.q4_dead, F->q4_iq, F->q4_step, 1, F->q4_max_blocks, sh, F->q4_scores,
                                 (void*) s);
             k::qsa_block_topk(F->q4_scores, F->q4_step, 1, F->q4_max_blocks, F->q4_cap, sh, F->q4_ids, (void*) s);
@@ -978,12 +1162,12 @@ bool Glm5Model::fast_qwen35_attn(int il, int64_t p64, std::string& err) {
                          F->q35_part, F->q35_ao, s);
     else if (!done)
         q35::attn_decode(F->q35_q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, p + 1, 1.0f / std::sqrt((float) D),
-                         F->q35_part, F->q35_ao, s);
+                         F->q35_part, F->q35_ao, s, q35_kv_);
     if (dumps) {
         q35_dump(s, "Qcur", il, F->q35_q, HD);
         q35_dump(s, "attn_pregate", il, F->q35_ao, HD);
     }
-    q35::attn_gate(F->q35_ao, F->q35_qf, g.n_head, D, s);
+    q35::attn_gate(F->q35_ao, F->q35_qf, g.n_head, D, s, q35_kv_);
     if (F->prof_on) F->mark("q35_attend");
     if (dumps) q35_dump(s, "attn_gated", il, F->q35_ao, HD);
     gf::quantize_q8_1(F->q35_ao, F->q35_aoq, HD, s);
@@ -1020,7 +1204,7 @@ bool Glm5Model::q4x_mix(const float* norm, const WSlot& down, const WSlot& up, c
     if (fused) {
         q35::hc4_fused(state_, out, inj_prev, norm, g.norm_eps, E, g.hc, LR, down.q, inject != nullptr ? inject->q : nullptr,
                        up.q, F->q4_lo, inj_out, F->q4_sc, F->q4_xn, F->q4_gate, x, xq, s,
-                       inject != nullptr && inject->type == gf::kTypeF32);
+                       inject != nullptr && inject->type == gf::kTypeF32, down.type, F->q4_xnq);
         return true;
     }
     return q4x_mix5(norm, down, up, inject, out, inj_prev, inj_out, x, xq, err);
