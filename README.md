@@ -44,6 +44,7 @@ on the PC size it is named for. Every one is set up with one command (below).
 | 12 GB | 32 GB | [Qwen3.8-Flash-Next-E448-IQ2_M-12G32G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-E448-IQ2_M-12G32G-GGUF) | 67.5 GB | `--model qwen38 --quant 12G32G` |
 | 16 GB | 64 GB | [Qwen3.8-Flash-Next-IQ3_M-16G64G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-IQ3_M-16G64G-GGUF) | 86.9 GB | `--model qwen38` |
 | 16 GB | 64 GB | [Ornith-1.5-122B-IQ3_XXS-16G64G](https://huggingface.co/zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF) | 51.7 GB | `--model ornith` |
+| 16 GB | 64 GB | [Ornith-1.5-397B-IQ2_XXS-16G64G](https://huggingface.co/zephel01/Ornith-1.5-397B-IQ2_XXS-16G64G-GGUF) | 110.6 GB | `--model ornith --quant 16G64G` (~9 tok/s, the 122B above is ~5x faster) |
 | 16 GB | 64 GB | [Qwen3.5-122B-A10B-IQ3_XXS-16G64G](https://huggingface.co/zephel01/Qwen3.5-122B-A10B-IQ3_XXS-16G64G-GGUF) | 51.4 GB | `--model qwen35` |
 | 16 GB | 64 GB | [DeepSeek-V4-Flash-0731-IQ1_S-16G64G](https://huggingface.co/zephel01/DeepSeek-V4-Flash-0731-IQ1_S-16G64G-GGUF) | 61.7 GB | `--quant 16G64G` |
 | 24 GB | 64 GB | [Qwen3.8-Flash-Next-IQ3_M-24G64G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-IQ3_M-24G64G-GGUF) | 93.7 GB | `--model qwen38 --quant 24G64G` |
@@ -56,6 +57,11 @@ on the PC size it is named for. Every one is set up with one command (below).
 | 32 GB | 128 GB | [GLM-5.3-Flash-IQ3_XXS-32G128G](https://huggingface.co/zephel01/GLM-5.3-Flash-IQ3_XXS-32G128G-GGUF) | 127.9 GB | `--model glm --quant 32G128G` |
 | 32 GB | 128 GB | [Ornith-1.5-397B-IQ2_XXS-32G128G](https://huggingface.co/zephel01/Ornith-1.5-397B-IQ2_XXS-32G128G-GGUF) | 114.2 GB | `--model ornith --quant 32G128G` |
 | DGX Spark | 128 GB unified | [Qwen3.8](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-DGX-Spark-GGUF) · [GLM-5.3-Flash](https://huggingface.co/zephel01/GLM-5.3-Flash-DGX-Spark-GGUF) · [V4 0731](https://huggingface.co/zephel01/DeepSeek-V4-Flash-0731-DGX-Spark-GGUF) (DGX-Spark) | 86.9-96.8 GB | [docs/DGX-SPARK](docs/DGX-SPARK.md) |
+
+An official file that Abyss runs well on a small GPU: **Ornith-1.5-35B-A3B** ([ornith-ai's Q4_K_M](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF), 21.7 GB, `--model ornith35`), for an 8-16 GB GPU + 32 GB RAM.
+RTX 5090 capped at 8 / 12 / 16 GB, 4K prompt + 512 tokens: decode 156 / 209 / 262 tok/s against llama.cpp's 106 / 133 / 173
+(same VRAM, best `--n-cpu-moe`), prompts 2,202 / 3,118 / 3,685 tok/s against 1,638 / 2,168 / 3,197 (`-ub 4096`). On a GPU that holds the whole file
+(24 GB and up) llama.cpp is faster.
 
 - The sizes are targets, not speed guarantees. A larger PC runs a smaller file faster; a smaller PC runs a larger one
   too, reading the experts that do not fit from the SSD (slower).
